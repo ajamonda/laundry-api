@@ -1,7 +1,12 @@
-import { ForbiddenException, Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../../../database/prisma.service';
 import { RouteEngineService } from '../../../processing-route/domain/route-engine.service';
 import { BillingService } from '../../../billing/domain/billing.service';
+import {
+  RouteChangeRequestAlreadyResolvedError,
+  RouteChangeRequestForbiddenError,
+  RouteChangeRequestNotFoundError,
+} from '../../domain/exception.errors';
 import { ExceptionGateway } from '../../interfaces/ws/exception.gateway';
 import { RouteChangeRequestView } from './request-route-change.use-case';
 
@@ -45,13 +50,13 @@ export class ApproveRouteChangeUseCase {
       },
     });
 
-    if (!changeRequest) throw new NotFoundException('경로 변경 요청을 찾을 수 없습니다.');
+    if (!changeRequest) throw new RouteChangeRequestNotFoundError(input.routeChangeRequestId);
     if (changeRequest.orderItem.order.customer.customerId !== input.customerId) {
-      throw new ForbiddenException('본인의 요청이 아닙니다.');
+      throw new RouteChangeRequestForbiddenError();
     }
     // Fast-fail (non-racy case).
     if (changeRequest.status !== 'PENDING') {
-      throw new ConflictException('이미 처리된 요청입니다.');
+      throw new RouteChangeRequestAlreadyResolvedError();
     }
 
     // CAS: atomic PENDING → APPROVED. Concurrent approve double-fire sees
@@ -62,7 +67,7 @@ export class ApproveRouteChangeUseCase {
       data: { status: 'APPROVED', respondedAt: new Date() },
     });
     if (claimed.count === 0) {
-      throw new ConflictException('이미 처리된 요청입니다.');
+      throw new RouteChangeRequestAlreadyResolvedError();
     }
 
     await this.routeEngine.switchRoute({

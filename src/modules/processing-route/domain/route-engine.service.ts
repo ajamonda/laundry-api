@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../../database/prisma.service';
 import { AuditLogger } from './audit-logger';
+import { findNextTemplateStep, pickNextStep } from './next-step';
 import {
   InvalidRouteCodeError,
   NoActivePlanError,
@@ -737,15 +738,13 @@ export class RouteEngineService {
           where: { code: overrideRow.flowCode, active: true },
           include: { steps: { orderBy: { offset: 'asc' } } },
         });
-        const nextTemplateStep = template?.steps.find((s) => s.offset > overrideRow.currentOffset) ?? null;
-        if (nextTemplateStep) {
-          nextOverrideStep = {
-            id: overrideRow.id,
-            stepType: nextTemplateStep.stepType,
-            displayName: nextTemplateStep.displayName,
-            sortOrder: overrideRow.baseStepSortOrder + nextTemplateStep.offset,
-          };
-        } else {
+        nextOverrideStep = findNextTemplateStep(
+          template?.steps ?? [],
+          overrideRow.currentOffset,
+          overrideRow.baseStepSortOrder,
+          overrideRow.id,
+        );
+        if (!nextOverrideStep) {
           // Last step of current override — pop to the previous override in the stack
           const stackPrev = await tx.itemProcessingOverride.findFirst({
             where: { orderItemId, status: 'ACTIVE', id: { not: overrideRow.id } },
@@ -763,21 +762,16 @@ export class RouteEngineService {
       }
     }
 
-    if (!nextOverrideStep && !nextRouteStep) return null;
+    const routeCandidate = nextRouteStep
+      ? {
+          id: nextRouteStep.id,
+          stepType: nextRouteStep.stepType,
+          displayName: nextRouteStep.displayName,
+          sortOrder: nextRouteStep.sortOrder,
+        }
+      : null;
 
-    if (!nextRouteStep || (nextOverrideStep && nextOverrideStep.sortOrder < nextRouteStep.sortOrder)) {
-      return { step: nextOverrideStep!, source: 'OVERRIDE' };
-    }
-
-    return {
-      step: {
-        id: nextRouteStep.id,
-        stepType: nextRouteStep.stepType,
-        displayName: nextRouteStep.displayName,
-        sortOrder: nextRouteStep.sortOrder,
-      },
-      source: 'ROUTE',
-    };
+    return pickNextStep(nextOverrideStep, routeCandidate);
   }
 
   private async loadRoute(tx: Prisma.TransactionClient, code: string): Promise<RouteRow> {

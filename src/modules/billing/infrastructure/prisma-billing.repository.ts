@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../../database/prisma.service';
+import { withIdempotency } from '../../../common/errors/idempotency';
 import { BillingAlreadyResolvedError } from '../domain/billing.errors';
 import {
   BillingRepository,
@@ -83,35 +84,35 @@ export class PrismaBillingRepository implements BillingRepository {
     const totalAmount = input.items.reduce((sum, i) => sum + i.amount, 0);
     const client = tx ?? this.prisma;
 
-    try {
-      const row = await client.billingRequest.create({
-        data: {
-          orderId: input.orderId,
-          type: 'BASE',
-          totalAmount,
-          items: {
-            create: input.items.map((i) => ({
-              orderItemId: i.orderItemId,
-              amount: i.amount,
-            })),
+    return withIdempotency(
+      async () => {
+        const row = await client.billingRequest.create({
+          data: {
+            orderId: input.orderId,
+            type: 'BASE',
+            totalAmount,
+            items: {
+              create: input.items.map((i) => ({
+                orderItemId: i.orderItemId,
+                amount: i.amount,
+              })),
+            },
+            events: {
+              create: { eventType: 'BILLING_CREATED' },
+            },
           },
-          events: {
-            create: { eventType: 'BILLING_CREATED' },
-          },
-        },
-        include: { items: true },
-      });
-      return this.toView(row);
-    } catch (e) {
-      if (this.isUniqueConstraintError(e)) {
+          include: { items: true },
+        });
+        return this.toView(row);
+      },
+      async () => {
         const existing = await client.billingRequestItem.findUnique({
           where: { orderItemId: input.items[0].orderItemId },
           include: { billingRequest: { include: { items: true } } },
         });
-        if (existing) return this.toView(existing.billingRequest);
-      }
-      throw e;
-    }
+        return existing ? this.toView(existing.billingRequest) : null;
+      },
+    );
   }
 
   /**
@@ -125,29 +126,26 @@ export class PrismaBillingRepository implements BillingRepository {
     totalAmount: number;
     source: BillingSource;
   }): Promise<BillingRequestView> {
-    try {
-      const row = await this.prisma.billingRequest.create({
-        data: {
-          orderId: input.orderId,
-          type: 'SUPPLEMENT',
-          totalAmount: input.totalAmount,
-          sourceType: input.source.type,
-          sourceId: input.source.id,
-          // notifiedAt deliberately left null — see method docstring.
-          events: {
-            create: { eventType: 'BILLING_CREATED' },
+    return withIdempotency(
+      async () => {
+        const row = await this.prisma.billingRequest.create({
+          data: {
+            orderId: input.orderId,
+            type: 'SUPPLEMENT',
+            totalAmount: input.totalAmount,
+            sourceType: input.source.type,
+            sourceId: input.source.id,
+            // notifiedAt deliberately left null — see method docstring.
+            events: {
+              create: { eventType: 'BILLING_CREATED' },
+            },
           },
-        },
-        include: { items: true },
-      });
-      return this.toView(row);
-    } catch (e) {
-      if (this.isUniqueConstraintError(e)) {
-        const existing = await this.findBySource(input.source);
-        if (existing) return existing;
-      }
-      throw e;
-    }
+          include: { items: true },
+        });
+        return this.toView(row);
+      },
+      () => this.findBySource(input.source),
+    );
   }
 
   /**
@@ -235,12 +233,6 @@ export class PrismaBillingRepository implements BillingRepository {
     };
 
     return tx ? work(tx) : this.prisma.$transaction(work);
-  }
-
-  private isUniqueConstraintError(e: unknown): boolean {
-    return (
-      e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002'
-    );
   }
 
   private toView(row: BillingRow): BillingRequestView {

@@ -2,6 +2,8 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../../database/prisma.service';
 import { CatalogRepository } from '../domain/catalog.repository';
+import { calculatePrice } from '../domain/pricing';
+import { resolveRouteCode, RouteRule } from '../domain/route-resolution';
 import {
   CatalogItemDetail,
   CatalogItemSummary,
@@ -47,14 +49,6 @@ type CatalogOptionRow = CatalogOptionGroupRow['options'][number];
 type CatalogOptionChildRow = CatalogOptionRow['children'][number];
 type CatalogPriceRow = CatalogOptionRow['prices'][number];
 type CatalogItemInputRow = CatalogItemWithRelations['inputs'][number];
-
-type RouteRule = {
-  itemCode: string;
-  isPremium: boolean | null;
-  hasRepair: boolean | null;
-  routeCode: string;
-  priority: number;
-};
 
 type CalculatedSelectedOption = EstimatedOption & {
   catalogOptionGroupId: string;
@@ -308,7 +302,7 @@ export class PrismaCatalogRepository implements CatalogRepository {
 
       calculatedItems.push({
         catalogItemId: detail.id,
-        processingRouteCode: this.resolveRouteCode(inputItem.itemCode, inputItem.options, rules),
+        processingRouteCode: resolveRouteCode(inputItem.itemCode, inputItem.options, rules),
         itemCode: detail.code,
         displayName: detail.displayName,
         estimatedMinAmount,
@@ -367,7 +361,7 @@ export class PrismaCatalogRepository implements CatalogRepository {
       }
 
       const price = option.prices[0] ?? this.emptyPrice();
-      const amounts = this.calculatePrice(price, selectedOption.quantity);
+      const amounts = calculatePrice(price, selectedOption.quantity);
 
       return {
         catalogOptionGroupId: group.id,
@@ -383,40 +377,6 @@ export class PrismaCatalogRepository implements CatalogRepository {
         price,
       };
     });
-  }
-
-  private calculatePrice(
-    price: CatalogPrice,
-    quantity?: number,
-  ): { min: number; max: number } {
-    if (price.priceType === 'FIXED' || price.priceType === 'MATRIX') {
-      const amount = price.amount ?? 0;
-      return { min: amount, max: amount };
-    }
-
-    if (price.priceType === 'RANGE') {
-      return {
-        min: price.minAmount ?? 0,
-        max: price.maxAmount ?? price.minAmount ?? 0,
-      };
-    }
-
-    if (price.priceType === 'UNIT') {
-      const baseAmount = price.baseAmount ?? price.amount ?? 0;
-      const baseQuantity = price.baseQuantity ? Number(price.baseQuantity) : 0;
-      const extraUnitQuantity = price.extraUnitQuantity
-        ? Number(price.extraUnitQuantity)
-        : 0;
-      const extraUnitAmount = price.extraUnitAmount ?? 0;
-      const selectedQuantity = quantity ?? baseQuantity;
-      const extraQuantity = Math.max(selectedQuantity - baseQuantity, 0);
-      const extraUnits =
-        extraUnitQuantity > 0 ? Math.ceil(extraQuantity / extraUnitQuantity) : 0;
-      const amount = baseAmount + extraUnits * extraUnitAmount;
-      return { min: amount, max: amount };
-    }
-
-    return { min: 0, max: 0 };
   }
 
   private findOptionByCode(
@@ -524,30 +484,6 @@ export class PrismaCatalogRepository implements CatalogRepository {
     extraUnitQuantity: price.extraUnitQuantity?.toString() ?? null,
     extraUnitAmount: price.extraUnitAmount,
   });
-
-  /**
-   * Data-driven route resolution. `rules` is loaded once per request from
-   * `route_resolution_rules`; matching is in-memory (tri-state predicates +
-   * priority desc). Returns null if no rule matches.
-   */
-  private resolveRouteCode(
-    itemCode: string,
-    options: EstimateSelectedOption[],
-    rules: RouteRule[],
-  ): string | null {
-    const isPremium = options.some(
-      (o) => o.groupCode === 'cleaning_method' && o.optionCode === 'premium_wash',
-    );
-    const hasRepair = options.some((o) => o.groupCode === 'repair');
-
-    const candidates = rules
-      .filter((r) => r.itemCode === itemCode)
-      .filter((r) => r.isPremium === null || r.isPremium === isPremium)
-      .filter((r) => r.hasRepair === null || r.hasRepair === hasRepair)
-      .sort((a, b) => b.priority - a.priority);
-
-    return candidates[0]?.routeCode ?? null;
-  }
 
   private emptyPrice(): CatalogPrice {
     return {

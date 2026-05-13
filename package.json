@@ -12,6 +12,7 @@
     "prisma:studio": "prisma studio",
     "prisma:seed": "ts-node prisma/seed.ts",
     "test:setup": "ts-node --transpile-only scripts/setup-test-session.ts",
+    "test:unit": "jest --config test/jest-unit.json",
     "test:e2e": "jest --config test/jest-e2e.json --runInBand"
   },
   "dependencies": {

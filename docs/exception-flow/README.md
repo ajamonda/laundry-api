@@ -86,6 +86,8 @@ Namespace `/exception`. Room `customer:${customerId}`.
 | SUPPLEMENT duplicate creation | `BillingRequest` `UNIQUE(sourceType, sourceId)` ([billing](../billing/README.md)) |
 | Concurrent override mutations | `loadState` `SELECT ... FOR UPDATE` in `RouteEngineService` |
 
+**Known gap (not currently protected)**: `request-route-change` (POST `/wash/items/:id/request-route-change`) performs a read-then-write check (`findFirst({ status: 'PENDING' })` → `create`) without CAS or a partial UNIQUE. Two simultaneous requests for the same item can both succeed and create two `PENDING` rows. The sequential guard (`PendingRouteChangeExistsError`) still fires for subsequent retries. If you add concurrent protection, the canonical fix is a Postgres partial UNIQUE index on `(orderItemId) WHERE status = 'PENDING'`; once added, promote the sequential test in `test/e2e/exception-races.e2e-spec.ts` to a `Promise.all` race.
+
 ## Seed templates (11)
 
 `REPAIR_APPROVAL_FLOW`, `VENDOR_APPROVAL_FLOW`, `PREMIUM_APPROVAL_FLOW`, `REWASH_FLOW`, `ADDITIONAL_REPAIR_FLOW`, `ADDITIONAL_VENDOR_FLOW`, `DAMAGE_RISK_APPROVAL_FLOW`, `STAIN_REMOVAL_FAILED_FLOW`, `PAYMENT_FAILED_FLOW`, `PAYMENT_PENDING_FLOW`, `RETURN_WITHOUT_PROCESSING_FLOW`. Step types are free-form strings — meaning lives in `prisma/seed.ts`.
