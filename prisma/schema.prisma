@@ -451,6 +451,10 @@ model RouteChangeRequest {
   orderItem        OrderItem @relation(fields: [orderItemId], references: [id])
 
   @@index([orderItemId, status])
+  // Partial UNIQUE: at most one PENDING row per orderItemId. Not expressible
+  // in Prisma schema; defined in raw SQL at migration
+  // 20260514120000_route_change_one_pending_per_item. The use case maps the
+  // resulting P2002 to PendingRouteChangeExistsError via mapUniqueConflict.
   @@map("route_change_requests")
 }
 

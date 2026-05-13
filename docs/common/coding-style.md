@@ -42,10 +42,20 @@ Specific bans:
 
 ## Idempotency rules
 
-- **Idempotency keys are DB UNIQUE constraints, not application-level checks.**
-- BASE billing: `billing_request_items.order_item_id` UNIQUE.
-- SUPPLEMENT billing: `billing_requests.(source_type, source_id)` UNIQUE.
-- When you add a "must exist exactly one per X" rule, encode it as a UNIQUE index. The repository INSERT MUST use `withIdempotency(insert, fetchExisting)` from [`src/common/errors/idempotency.ts`](../../src/common/errors/idempotency.ts) to handle P2002. Hand-rolled `try { ... } catch (e) { if (e.code === 'P2002') ... }` blocks in repositories are forbidden — they drift in subtle ways (silently returning null, missing the instanceof check, re-throwing the wrong error). `withIdempotency` is the only sanctioned shape.
+- **Uniqueness invariants are DB constraints, not application-level checks.** A read-then-write pre-check is fine as a fast-fail optimisation but the DB index must be the authoritative guard.
+- **Two sanctioned shapes for P2002 handling**, both in [`src/common/errors/idempotency.ts`](../../src/common/errors/idempotency.ts):
+
+  | Helper | Semantics | When to use |
+  |---|---|---|
+  | `withIdempotency(insert, fetchExisting)` | P2002 → return the existing row | "this insert is idempotent — second call must succeed and yield the same row" (e.g. BASE billing on tag-item retry, SUPPLEMENT billing on approval double-fire) |
+  | `mapUniqueConflict(insert, errorFactory)` | P2002 → throw a `DomainError` | "this insert encodes a domain invariant — concurrent violator must see a 409 with a meaningful `code`" (e.g. one PENDING route-change per item) |
+
+- **Hand-rolled `try { ... } catch (e) { if (e.code === 'P2002') ... }` blocks are forbidden.** They drift (silent null returns, missing `instanceof` check, wrong rethrow). Always go through one of the two helpers above.
+- **Partial UNIQUE indexes** (e.g. `... WHERE status = 'PENDING'`) cannot be expressed in Prisma's schema today. Define them in a raw SQL migration (see `prisma/migrations/20260514120000_route_change_one_pending_per_item` as canonical example) and leave a comment on the relevant `model` in `schema.prisma` pointing at the migration. Always pair with `mapUniqueConflict` / `withIdempotency` in the use case — never rely on the pre-check alone.
+- **Existing UNIQUE constraints in the codebase**:
+  - `billing_request_items.order_item_id` UNIQUE — BASE billing per item
+  - `billing_requests.(source_type, source_id)` UNIQUE — SUPPLEMENT billing per source
+  - `route_change_requests (order_item_id) WHERE status = 'PENDING'` PARTIAL UNIQUE — one PENDING route-change per item
 
 ## Authentication rules
 

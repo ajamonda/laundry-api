@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { mapUniqueConflict } from '../../../../common/errors/idempotency';
 import { PrismaService } from '../../../../database/prisma.service';
 import { RouteEngineService } from '../../../processing-route/domain/route-engine.service';
 import { ActorContext } from '../../../processing-route/domain/processing-route.types';
@@ -41,6 +42,10 @@ export class RequestRouteChangeUseCase {
       throw new ItemNotIssuableError(input.itemId);
     }
 
+    // Fast-fail pre-check (saves a round-trip in the common case). The
+    // create() below is the authoritative guard via the partial UNIQUE
+    // index `(order_item_id) WHERE status = 'PENDING'` — see migration
+    // 20260514120000_route_change_one_pending_per_item.
     const pendingRouteChange = await this.prisma.routeChangeRequest.findFirst({
       where: { orderItemId: input.itemId, status: 'PENDING' },
     });
@@ -56,17 +61,25 @@ export class RequestRouteChangeUseCase {
     const currentState = await this.routeEngine.getCurrentState(input.itemId);
     const fromRouteCode = currentState.routeCode;
 
-    const changeRequest = await this.prisma.routeChangeRequest.create({
-      data: {
-        orderItemId: input.itemId,
-        fromRouteCode,
-        toRouteCode: input.toRouteCode,
-        additionalCost: input.additionalCost ?? null,
-        reason: input.reason,
-        status: 'PENDING',
-        requestedBy: input.actor.actorId,
-      },
-    });
+    // mapUniqueConflict handles the concurrent-race path: if a sibling
+    // request just inserted a PENDING row between the pre-check above and
+    // this create(), Postgres rejects with P2002 and we surface
+    // PendingRouteChangeExistsError — identical to the sequential branch.
+    const changeRequest = await mapUniqueConflict(
+      () =>
+        this.prisma.routeChangeRequest.create({
+          data: {
+            orderItemId: input.itemId,
+            fromRouteCode,
+            toRouteCode: input.toRouteCode,
+            additionalCost: input.additionalCost ?? null,
+            reason: input.reason,
+            status: 'PENDING',
+            requestedBy: input.actor.actorId,
+          },
+        }),
+      () => new PendingRouteChangeExistsError(input.itemId),
+    );
 
     this.exceptionGateway.notifyCustomer(
       item.order.customer.customerId,

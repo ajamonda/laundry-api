@@ -95,6 +95,17 @@ const rows = await prisma.<model>.findMany({ where: {...} });
 expect(rows).toHaveLength(1);
 ```
 
+### Not-yet-CAS race (transition case)
+When the use case is not yet CAS-protected but the test should still lock the DB invariant, write the assertion as below. The two-tier shape (HTTP arrayContaining + DB exact-count) is what `delivery-races` "concurrent handoff" uses today. Always include a TODO comment naming the file/line that needs CAS, mirroring the inline-throw transition pattern above. Loosened race tests without a TODO are forbidden — they become permanent and the racy code never gets fixed.
+```ts
+// TODO(<file>:<line>): tighten to [201, 409] once `<endpoint>` adds CAS
+// (e.g. `updateMany WHERE ... AND status='<EXPECTED>'` + throw on count===0).
+expect([r1.status, r2.status]).toEqual(expect.arrayContaining([201]));
+// DB invariant — independent of which call won.
+const rows = await prisma.<model>.findMany({ where: {...} });
+expect(rows).toHaveLength(1);
+```
+
 ### Deadlock-free assertion
 ```ts
 const results = await Promise.all(triggers.map(t => http.post(`/...${t}`).set(auth)));

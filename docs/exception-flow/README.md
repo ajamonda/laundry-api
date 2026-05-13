@@ -83,10 +83,9 @@ Namespace `/exception`. Room `customer:${customerId}`.
 |---|---|
 | Approval double-fire | CAS in `RespondApprovalUseCase`: `updateMany WHERE status='WAITING'` + throw on `count===0` |
 | Route-change approve double-fire | CAS in `ApproveRouteChangeUseCase`: `updateMany WHERE status='PENDING'` + throw on `count===0` |
+| Concurrent `request-route-change` for same item | Partial UNIQUE `(order_item_id) WHERE status='PENDING'` (migration `20260514120000_route_change_one_pending_per_item`) + `mapUniqueConflict` → `PendingRouteChangeExistsError`. The application's pre-check (`findFirst({ status: 'PENDING' })`) is a fast-fail optimisation only — the DB index is the authoritative guard |
 | SUPPLEMENT duplicate creation | `BillingRequest` `UNIQUE(sourceType, sourceId)` ([billing](../billing/README.md)) |
 | Concurrent override mutations | `loadState` `SELECT ... FOR UPDATE` in `RouteEngineService` |
-
-**Known gap (not currently protected)**: `request-route-change` (POST `/wash/items/:id/request-route-change`) performs a read-then-write check (`findFirst({ status: 'PENDING' })` → `create`) without CAS or a partial UNIQUE. Two simultaneous requests for the same item can both succeed and create two `PENDING` rows. The sequential guard (`PendingRouteChangeExistsError`) still fires for subsequent retries. If you add concurrent protection, the canonical fix is a Postgres partial UNIQUE index on `(orderItemId) WHERE status = 'PENDING'`; once added, promote the sequential test in `test/e2e/exception-races.e2e-spec.ts` to a `Promise.all` race.
 
 ## Seed templates (11)
 

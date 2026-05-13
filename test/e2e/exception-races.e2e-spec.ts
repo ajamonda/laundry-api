@@ -156,14 +156,6 @@ describe('exception-domain races', () => {
   });
 
   it('rejects a sequential second route-change while one is PENDING', async () => {
-    // NOTE: this asserts the SEQUENTIAL guard (PendingRouteChangeExistsError).
-    // True concurrent protection is NOT implemented today — `request-route-
-    // change` performs a read-then-write without CAS / partial UNIQUE, so two
-    // simultaneous requests for the same item can both succeed. The docs
-    // (docs/exception-flow/README.md "Race / idempotency guarantees") do not
-    // claim concurrent CAS for this endpoint. If/when added (e.g. partial
-    // UNIQUE on `(orderItemId, status='PENDING')`), promote this test to a
-    // Promise.all variant and assert {201, 409}.
     const customerToken = await authedCustomer(http);
     const pickupToken = await login(http, '/auth/staff/pickup/dev-login', { staffId: 'p1' });
     const washToken = await login(http, '/auth/staff/wash/dev-login', { staffId: 'w1' });
@@ -189,6 +181,50 @@ describe('exception-domain races', () => {
       .send(body);
     expect(second.status).toBe(409);
     expect(second.body.code).toBe('EXCEPTION_PENDING_ROUTE_CHANGE_EXISTS');
+
+    const prisma = getTestPrisma();
+    const pending = await prisma.routeChangeRequest.findMany({
+      where: { orderItemId: itemIds[0], status: 'PENDING' },
+    });
+    expect(pending).toHaveLength(1);
+  });
+
+  it('rejects concurrent route-change requests for the same item via partial UNIQUE', async () => {
+    // Race coverage for the partial UNIQUE
+    //   `(order_item_id) WHERE status = 'PENDING'`
+    // (migration 20260514120000_route_change_one_pending_per_item). Two
+    // simultaneous requests both pass the read-then-write pre-check; the
+    // loser's INSERT trips P2002, which `mapUniqueConflict` rethrows as
+    // `PendingRouteChangeExistsError` — identical wire shape to the
+    // sequential second-call case.
+    const customerToken = await authedCustomer(http);
+    const pickupToken = await login(http, '/auth/staff/pickup/dev-login', { staffId: 'p1' });
+    const washToken = await login(http, '/auth/staff/wash/dev-login', { staffId: 'w1' });
+
+    const orderId = await createOrder(http, customerToken, 1);
+    const itemIds = await pickupTo(http, orderId, pickupToken);
+    await tagAll(http, itemIds, washToken);
+
+    const body = {
+      toRouteCode: 'PREMIUM_CLEANING',
+      additionalCost: 5000,
+      reason: 'concurrent request test',
+    };
+    const [r1, r2] = await Promise.all([
+      http
+        .post(`/wash/items/${itemIds[0]}/request-route-change`)
+        .set('Authorization', `Bearer ${washToken}`)
+        .send(body),
+      http
+        .post(`/wash/items/${itemIds[0]}/request-route-change`)
+        .set('Authorization', `Bearer ${washToken}`)
+        .send(body),
+    ]);
+
+    const codes = [r1.status, r2.status].sort();
+    expect(codes).toEqual([201, 409]);
+    const loser = [r1, r2].find((r) => r.status === 409)!;
+    expect(loser.body.code).toBe('EXCEPTION_PENDING_ROUTE_CHANGE_EXISTS');
 
     const prisma = getTestPrisma();
     const pending = await prisma.routeChangeRequest.findMany({
