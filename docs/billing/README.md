@@ -1,134 +1,152 @@
 # Billing
 
-## 개요
+`src/modules/billing/`
 
-`BillingRequest`는 두 타입이 있음:
+## Tables
+- `billing_requests` — BASE + SUPPLEMENT rows
+- `billing_request_items` — line items (BASE only)
+- `payment_events` — billing-side timeline (`BILLING_CREATED`, `PAYMENT_SUCCEED`, `PAYMENT_FAILED`)
 
-- **BASE** — `tag-item` 시점에 item마다 1개씩 생성. `totalAmount`는 tag 시점의 `orderItem.estimatedMinAmount`로 **freeze** (그 이후 절대 변경되지 않음).
-- **SUPPLEMENT** — route-change 승인 / approval 응답 시점에 추가 비용만큼 생성. `totalAmount`는 양수/음수 모두 허용 (MVP — 음수는 환불성).
+## Exports
+| Symbol | Used by |
+|---|---|
+| `BillingService` | `wash` (`onItemTagged`, `onItemReadyToPackage`), `exception` (`createSupplementBillingForApproval`, `createSupplementBillingForRouteChange`) |
 
-두 타입 모두 생성 시점엔 `notifiedAt = null`로 두고, **고객에게 push되는 것은 어떤 item이든 `READY_TO_PACKAGE`에 도달할 때만**. 그때 atomic claim으로 그 order의 모든 미통보 WAITING row를 한꺼번에 notify 마킹하고, `/billing` 소켓으로 `BillingRequest[]` 페이로드를 1건 emit.
+## Two row types
 
-user-web 클라이언트는 페이로드를 `orderId`로 그룹핑하고 `totalAmount`를 합산하여 한 카드로 표시 (BASE + 모든 SUPPLEMENT 합계).
+| Type | Created at | `totalAmount` | `notifiedAt` at creation | `sourceType` / `sourceId` |
+|---|---|---|---|---|
+| BASE | `tag-item` | snapshot of `orderItem.estimatedMinAmount` at tag time — **frozen, never updated by server** | null | both null |
+| SUPPLEMENT | approval `APPROVE_*` with `extraAmount`, or route-change approve with `additionalCost` | the extra amount (signed — negative allowed for refunds) | null | `'APPROVAL_REQUEST' \| 'ROUTE_CHANGE_REQUEST'` + the request's id |
 
-## Push 트리거 — 표 (모든 경우)
+## Push trigger — every case
 
-| # | 시나리오 | Push? | 페이로드 |
+| # | Scenario | Push? | Payload |
 |---|---|---|---|
-| 1 | 단일 item order의 RTP 도달 | ✅ | `[BASE_item1]` |
-| 2 | 다중 item order의 **첫** RTP 도달 | ✅ | `[BASE_item1, ..., BASE_itemN]` — tag 시점에 이미 모든 BASE가 만들어졌으므로 한꺼번에 claim |
-| 3 | 다중 item order의 2번째 이후 RTP — 사이에 SUPPLEMENT 추가 없음 | ❌ | (claim 대상 0건이면 emit 생략) |
-| 4 | RTP 도달 + 사이에 route-change/approval로 SUPPLEMENT 생성됨 | ✅ | 그 order의 모든 WAITING (이미 notify된 것 포함, 클라이언트 replace upsert 때문) |
+| 1 | Single-item order, item reaches RTP | ✅ | `[BASE_item1]` |
+| 2 | Multi-item order, **first** RTP arrival | ✅ | `[BASE_item1, ..., BASE_itemN]` (every BASE created at tag time → all claimed at once) |
+| 3 | Multi-item order, subsequent RTP arrival without new SUPPLEMENT in between | ❌ | (zero rows claimed → emit suppressed) |
+| 4 | Any RTP arrival with a SUPPLEMENT created since last push | ✅ | Order's complete WAITING set (the client replaces by orderId — payload must carry the full picture) |
 
-다음 시점은 push **안 함**:
-- Order 생성, tag-item (BASE 생성), approval 응답 (SUPPLEMENT 생성), route-change 승인 (SUPPLEMENT 생성), pay/cancel, 일반 scan-step (RTP 아닌 경우), reconnect (대신 REST `GET /billing/requests` 사용).
+**Never pushes**: order creation, tag-item, approval response, route-change approval, pay/cancel, regular scan-step that doesn't reach RTP, socket reconnect (REST `GET /billing/requests` handles that).
 
-## 트리거 흐름 — 코드 경로
+## Code flow
 
 ```
-POST /wash/items/:id/tag                              (item 마다)
+POST /wash/items/:id/tag                      (once per item)
   └─ TagItemUseCase
        └─ BillingService.onItemTagged
-            └─ INSERT billing_request(type=BASE, notifiedAt=null,
-                                      totalAmount=estimatedMinAmount)
-            └─ INSERT billing_request_items
-            (idempotent: P2002 시 기존 row 반환)
+            └─ repo.createBillingRequest
+                 ├─ INSERT billing_request(type=BASE, totalAmount=estimatedMinAmount, notifiedAt=null)
+                 ├─ INSERT billing_request_items
+                 └─ catch P2002 on duplicate orderItemId → return existing row (idempotent)
 
-POST /wash/approval-requests/:id/respond  (decision=APPROVE_*, extraAmount>0)
+POST /wash/approval-requests/:id/respond  (decision=APPROVE_*, extraAmount > 0)
   └─ RespondApprovalUseCase
-       ├─ CAS approval status WAITING → RESOLVED
-       └─ BillingService.createSupplementBillingForApproval
-            └─ INSERT billing_request(type=SUPPLEMENT, notifiedAt=null,
-                                      sourceType='APPROVAL_REQUEST',
-                                      sourceId=approvalId)
-            (idempotent: UNIQUE(sourceType, sourceId))
+       ├─ CAS approval status WAITING → RESOLVED (throws on count===0)
+       └─ BillingService.createSupplementBillingForApproval(approvalRequestId, ...)
+            └─ repo.createSupplementBillingRequest
+                 ├─ INSERT billing_request(type=SUPPLEMENT, notifiedAt=null,
+                 │                         sourceType='APPROVAL_REQUEST', sourceId=approvalId)
+                 └─ catch P2002 on UNIQUE(sourceType, sourceId) → return existing row
 
-POST /wash/route-change-requests/:id/approve   (additionalCost ≠ 0)
+POST /wash/route-change-requests/:id/approve  (additionalCost ≠ 0)
   └─ ApproveRouteChangeUseCase
-       ├─ CAS routeChange status PENDING → APPROVED
-       ├─ routeEngine.switchRoute
-       ├─ orderItemOption swap (cleaning_method)
-       ├─ BillingService.createSupplementBillingForRouteChange
-       │    └─ INSERT billing_request(type=SUPPLEMENT, notifiedAt=null,
-       │                              sourceType='ROUTE_CHANGE_REQUEST',
-       │                              sourceId=routeChangeRequestId)
+       ├─ CAS routeChange status PENDING → APPROVED (throws on count===0)
+       ├─ RouteEngineService.switchRoute
+       ├─ orderItemOption swap (cleaning_method to match new route)
+       ├─ BillingService.createSupplementBillingForRouteChange(routeChangeRequestId, ...)
+       │    └─ repo.createSupplementBillingRequest (same idempotency as above)
        └─ orderItem.estimatedMinAmount += additionalCost
-          (wash-web의 다음 route-change 차액 계산용 누적값)
+          (running total for wash-web's RouteChangeForm — NOT a BASE-billed amount)
 
-POST /wash/tags/:tag/scan-step  (plan 완료 트리거)
+POST /wash/tags/:tag/scan-step  (when plan completes → status=READY_TO_PACKAGE)
   └─ ScanStepUseCase
-       └─ item status PROCESSING → READY_TO_PACKAGE
-       └─ BillingService.onItemReadyToPackage
-            └─ repo.claimAndFetchWaiting(orderId)  [SINGLE TX]
-                 ├─ updateMany SET notifiedAt=NOW
-                 │   WHERE orderId AND status='WAITING' AND notifiedAt IS NULL
-                 │   → just_claimed count
-                 └─ findMany WHERE orderId AND status='WAITING'
-                   → all WAITING (newly + previously notified)
-            └─ if just_claimed > 0:
-                 socket emit `billing:created` payload=allWaiting
+       └─ BillingService.onItemReadyToPackage(orderId)
+            └─ repo.claimAndFetchWaiting(orderId)   [single transaction]
+                 ├─ UPDATE billing_requests
+                 │     SET notifiedAt = NOW
+                 │     WHERE orderId = $ AND status = 'WAITING' AND notifiedAt IS NULL
+                 │   → justClaimedCount
+                 └─ SELECT * FROM billing_requests
+                       WHERE orderId = $ AND status = 'WAITING'
+                   → allWaiting (newly + previously claimed)
+            └─ if justClaimedCount > 0 && allWaiting.length > 0:
+                  gateway.notifyCustomer(customerId, 'billing:created', allWaiting)
 ```
 
-## 멱등성 / Race 보호
+## Race / idempotency guarantees
 
-| 보호 | 어디서 |
-|---|---|
-| Pay/Cancel CAS | `updateMany WHERE id AND status='WAITING'` + count 0 시 throw |
-| BASE 중복 (tag-item 더블탭) | `billing_request_items.order_item_id` UNIQUE → P2002 catch → 기존 row 반환 |
-| SUPPLEMENT 중복 (approval/route-change 더블탭) | (1) 호출자 CAS on request status, (2) `UNIQUE(sourceType, sourceId)` |
-| `claimAndFetchWaiting` 데드락 | 단일 `updateMany` statement로 row lock 일괄 획득 — 순환 대기 불가 |
-| 중복 emit | `just_claimed === 0` 시 emit 생략 |
+| Risk | Protection | Where |
+|---|---|---|
+| Pay/Cancel double-fire | `updateMany WHERE id AND status='WAITING'` + `count===0` throws | `resolveRequest` |
+| Tag-item double-fire → duplicate BASE | `billing_request_items.order_item_id` UNIQUE + P2002 catch → existing | `createBillingRequest` |
+| Approval / route-change double-fire → duplicate SUPPLEMENT | (a) CAS on request status, (b) `UNIQUE(sourceType, sourceId)` + P2002 catch | `RespondApprovalUseCase` + `createSupplementBillingRequest` |
+| Concurrent RTP for sibling items → deadlock | Single-statement `updateMany` locks rows in PG scan order; second tx waits then sees 0 unnotified | `claimAndFetchWaiting` |
+| Redundant emit on subsequent RTP | Suppress when `justClaimedCount === 0` | `onItemReadyToPackage` |
+| At-most-once notify (emit failure after commit) | Customer reconnect → `GET /billing/requests` (`notifiedAt != null`) replays. MVP-accepted — no outbox |
 
-## 금액 / 합산
+Transaction isolation is PG default (`READ COMMITTED`). All guarantees use row locks / CAS / UNIQUE — do not elevate isolation.
 
-- **BASE.totalAmount**: tag 시점 freeze. 이후 변하지 않음.
-- **SUPPLEMENT.totalAmount**: 운영자(wash-web)가 산정해서 넣음. 양수/음수 모두 가능.
-- **user-web의 화면 표시**: BASE + 모든 SUPPLEMENT의 `totalAmount`를 단순 합산 (클라이언트 `reduce`).
+## Endpoints (CustomerAuthGuard)
 
-## API
-
-| Method | Path | Guard | Notes |
+| Method | Path | Use case | Notes |
 |---|---|---|---|
-| `GET` | `/billing/requests` | Customer | 내 WAITING + notified 목록 (재연결 복원용). `notifiedAt IS NULL` row는 제외 — push 전에는 고객 화면에 안 보임. |
-| `GET` | `/billing/requests/:id` | Customer | 단건 조회. |
-| `POST` | `/billing/requests/:id/pay` | Customer | CAS WAITING→PAID. |
-| `POST` | `/billing/requests/:id/cancel` | Customer | CAS WAITING→CANCELLED. |
+| `GET` | `/billing/requests` | `GetCustomerBillingRequestsUseCase` | WAITING rows where `notifiedAt != null` — reconnect recovery. Pre-push rows are deliberately hidden |
+| `GET` | `/billing/requests/:id` | `GetBillingRequestUseCase` | Single row |
+| `POST` | `/billing/requests/:id/pay` | `PayBillingRequestUseCase` | CAS WAITING → PAID |
+| `POST` | `/billing/requests/:id/cancel` | `CancelBillingRequestUseCase` | CAS WAITING → CANCELLED |
 
-소유권 검증: `billingRequest.order.customer.customerId === requestingCustomerId`. UUID PK인 `order.customer_id`와 비교 금지.
-
-## Delivery gate 연동
-
-`scan-outbound`는 그 order의 모든 BASE + SUPPLEMENT가 결제 완료된 후에만 허용. `delivery.countWaitingBillings(orderId) > 0`이면 `BillingNotPaidError(409)`.
+Ownership check: `billingRequest.order.customer.customerId === requestingCustomerId`. **Never** compare against `order.customer_id` (UUID PK — confirmed foot-gun).
 
 ## WebSocket — `/billing`
 
-- 인증: `socket.handshake.auth.token` (Bearer JWT, CUSTOMER).
-- Room: `customer:${customerId}`.
+| Event | Payload | When |
+|---|---|---|
+| `billing:created` | `BillingRequest[]` (order's complete WAITING set) | RTP trigger AND at least one row was freshly notified by this call |
 
-| 이벤트 | 방향 | payload | 트리거 |
-|---|---|---|---|
-| `billing:created` | server → client | `BillingRequest[]` (그 order의 WAITING 전체) | item이 READY_TO_PACKAGE 도달 + 새로 claim한 row 1건 이상 |
+Client groups by `orderId` and sums `totalAmount` (`laundry-user-web/src/useRealtimeRequests.ts:upsertBillingMessages`). Server sends rows; client computes the displayed sum.
 
-## Schema
+## Delivery gate
+
+`scan-outbound` (delivery domain) requires `delivery.countWaitingBillings(orderId) === 0`. BASE and SUPPLEMENT both block. See [delivery/README.md](../delivery/README.md#billing-gate-scan-outbound).
+
+## Schema (excerpt)
 
 ```prisma
 model BillingRequest {
   id          String    @id @default(uuid())
   orderId     String    @map("order_id")
-  type        String    @default("BASE")    // BASE / SUPPLEMENT
-  sourceType  String?   @map("source_type") // SUPPLEMENT 멱등성 키
+  type        String    @default("BASE")    // BASE | SUPPLEMENT
+  sourceType  String?   @map("source_type") // SUPPLEMENT idempotency key
   sourceId    String?   @map("source_id")
-  status      String    @default("WAITING") // WAITING / PAID / CANCELLED
-  totalAmount Int       @map("total_amount")
+  status      String    @default("WAITING") // WAITING | PAID | CANCELLED
+  totalAmount Int       @map("total_amount") // signed; negative SUPPLEMENT allowed
   createdAt   DateTime  @default(now())
   resolvedAt  DateTime?
   notifiedAt  DateTime?
 
   @@index([orderId, type])
-  @@unique([sourceType, sourceId])
+  @@unique([sourceType, sourceId])  // PG NULLs are distinct → only constrains SUPPLEMENT rows
 }
 ```
 
-## Module
+## Invariants
 
-`BillingModule`은 `BillingService`를 export. `WashModule`, `ExceptionModule`이 import.
+- BASE `totalAmount` is set once at creation and never updated.
+- SUPPLEMENT `notifiedAt` is null until the next RTP claim of the order.
+- `(sourceType, sourceId)` is non-null on every SUPPLEMENT and uniquely identifies its origin domain object.
+- `payment_events` rows accumulate (`BILLING_CREATED` + resolution event). Tests filtering for "exactly one resolution" must constrain `eventType: { in: ['PAYMENT_SUCCEED', 'PAYMENT_FAILED'] }`.
+
+## Anti-patterns (do not)
+
+- **Do not push on SUPPLEMENT creation.** The spec is batched-with-BASE at next RTP. Past mistake: I added `createAndNotifySupplement` immediate-emit during a race-fix refactor and shipped it as "the design"; the original comment in `approve-route-change.use-case.ts` said otherwise. Reverted.
+- **Do not overwrite BASE `totalAmount` with `orderItem.estimatedMinAmount` at RTP time.** That field accumulates `additionalCost` from route changes; using it as fallback double-counts (charged once in updated BASE, once in SUPPLEMENT).
+- **Do not introduce `createSupplementBilling` without a `source` argument.** Idempotency is enforced by `UNIQUE(sourceType, sourceId)` + P2002 catch — supplying both columns is mandatory at the service-API level.
+
+## When you change this domain
+
+- New SUPPLEMENT source (e.g. `MANUAL_ADJUSTMENT`) → extend `BillingSource` union, add a new `createSupplementBillingFor*` method on `BillingService`, document the source value in the two-row-types table.
+- New push trigger (currently only RTP) → update the push-trigger table; verify client `useRealtimeRequests.ts` can still upsert correctly (it replaces by `billing:order:${orderId}` — payload must remain the full WAITING set).
+- New billing status (currently `WAITING | PAID | CANCELLED`) → update CAS conditions in `resolveRequest` and the delivery gate.
+- Schema change on `billing_requests` → migration + update [test/utils/db.ts](../../test/utils/db.ts) is not needed (table is already volatile).

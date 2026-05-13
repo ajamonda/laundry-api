@@ -1,78 +1,69 @@
-# Coding Style
+# Coding Style — Rules
 
-`laundry-api` is a pragmatic DDD modular monolith. Domain boundaries are
-enforced by folder + import discipline, not by separate services.
+DDD-ish modular monolith. The rules below are enforced by code review, not by tooling. Break them and the next race / refactor pays the cost.
 
-## Module Structure
+## Layer rules
 
-Every domain under `src/modules/<domain>/` follows the same four-layer split:
+Per domain at `src/modules/<domain>/`:
 
-```text
-interfaces/http   = controllers + class-validator DTOs
-interfaces/ws     = socket.io gateways (billing, exception)
-application       = use cases (one class per business action) + facades
-domain            = types, policies, repository ports (interfaces only), errors, domain services
-infrastructure    = Prisma repositories, external adapters
-```
+| Layer | Path | Allowed dependencies |
+|---|---|---|
+| `interfaces/http/` | controllers + DTOs | application |
+| `interfaces/ws/` | gateways | application, JwtService |
+| `application/use-cases/` | one class per action | domain |
+| `domain/` | types, policies, repository ports, errors, exported services | (none — pure) |
+| `infrastructure/` | Prisma repositories | domain, PrismaService |
 
-`src/common/` is reserved for cross-cutting concerns (auth, errors, etc.).
-`src/database/` holds Prisma module + service.
+Specific bans:
+- **Controllers must not access Prisma or repositories directly.** Call a use case.
+- **Use cases must not inject `PrismaService`.** All DB access goes through repositories. Repositories are the only place that knows Prisma.
+- **`domain/` must not import from `@prisma/client`** except for the enum types (`OrderItemStatus`, `OrderStatus`, etc.) — those are shared knowledge, not runtime client code.
+- **No `any` types** in production code. If a Prisma return type is hard to express, use `Prisma.<Model>GetPayload<{ include: ... }>`.
 
-## Dependency Rules
+## Cross-domain rules
 
-- Controllers call use cases only — no business logic in controllers.
-- Domain code does not know NestJS, Prisma, HTTP DTOs, or cache adapters.
-- Prisma types must not leak past `infrastructure/`.
-- **Domains never import another domain's internal services or repositories.**
-  Cross-domain calls go through a small exported facade/service (sync) or
-  domain events (async). Currently exported across domains:
-  - `RouteEngineService`, `AuditLogger` from `processing-route`
-  - `BillingService` from `billing`
+- **Domains never import another domain's repositories, use cases, or types.** Only the exported service.
+- Current exports (everything else is internal):
+  - `RouteEngineService`, `AuditLogger` from `processing-route` (exported by `ProcessingRouteModule`).
+  - `BillingService` from `billing` (exported by `BillingModule`).
+- Adding a new exported service: declare in `<domain>.module.ts` `exports:`, document in the domain README, update [docs/README.md](../README.md) "Exports" column.
 
-## Repository Pattern
+## Transaction rules
 
-```text
-modules/<domain>/
-  domain/<name>.repository.ts          # interface + DI symbol token (e.g. WASH_REPOSITORY)
-  infrastructure/prisma-<name>.repository.ts
-```
+- **Audit and the business write must be in the same transaction.** Pass `Prisma.TransactionClient` into `AuditLogger.logInTransaction(tx, ...)`. Never call `AuditLogger` outside a tx.
+- **`SELECT ... FOR UPDATE`** is used in `RouteEngineService.loadState` to serialize concurrent mutations on the same item. Apply the same pattern when adding any new read-then-write on a shared row.
+- **CAS pattern for status flips**: `tx.<model>.updateMany({ where: { id, status: 'WAITING' }, data: { status: 'NEXT' } })` + throw if `count === 0`. Used by `BillingRepository.resolveRequest`, `RespondApprovalUseCase`, `ApproveRouteChangeUseCase`. Apply to every new "X must move from state A to state B exactly once" code path.
+- **Default isolation level: PG `READ COMMITTED`.** Do not change global isolation. Per-tx override only with retry middleware (currently absent — don't introduce).
 
-Inject via tokens. Tests can bind the same port to a fake.
+## Idempotency rules
 
-## Audit Writes
+- **Idempotency keys are DB UNIQUE constraints, not application-level checks.**
+- BASE billing: `billing_request_items.order_item_id` UNIQUE.
+- SUPPLEMENT billing: `billing_requests.(source_type, source_id)` UNIQUE.
+- When you add a "must exist exactly one per X" rule, encode it as a UNIQUE index. Repository INSERT must catch P2002 and return the existing row.
 
-Every business state change writes its AuditLog row in the **same
-transaction** via `AuditLogger.logInTransaction(tx, params)`. Callers pass
-their own `Prisma.TransactionClient` — never write AuditLog after the tx
-commits.
+## Authentication rules
 
-## API Style
+- Customer and staff are different subjects. Never merge into one principal type.
+- `CustomerAuthGuard` for customer routes (injects `CustomerPrincipal`).
+- `StaffAuthGuard` + `@StaffRoles(...)` for staff routes (injects `StaffPrincipal`).
+- Mixing guards on the same endpoint is forbidden. If a flow needs both perspectives, split into two endpoints.
+- Ownership checks on customer-owned resources: traverse `order.customer.customerId`. **Never compare against `order.customer_id`** — that is a UUID PK, not the human customerId. Foot-gun confirmed by a past 403 bug.
 
-- Action-oriented endpoints (`scan-step`, `assign-route`, `respond`,
-  `handoff`, `activate-exception-flow`) — not `PUT /items/:id`.
-- Korean for user-facing display strings; English `snake_case` for codes /
-  IDs / DB columns.
-- Customer-vs-staff guards must not be mixed. A customer token must not call
-  staff APIs and vice versa.
+## API shape rules
 
-## Test Direction
+- Action-oriented endpoints (`scan-step`, `respond`, `handoff`, `assign-route`), not CRUD on status (`PUT /items/:id`).
+- Korean for user-facing display strings. English `snake_case` for codes / IDs / DB columns.
+- DTOs declared with `class-validator` decorators. Optional fields use `@IsOptional()`. Numbers use `@IsInt` or `@IsNumber`. Enums use `@IsIn([...])`.
 
-- Unit: pure domain policies.
-- Application: use cases with repository fakes or a test DB.
-- Repository contract tests when caching is introduced.
-- Integration: facade/event boundaries.
-- E2E: full flow (order → pickup → wash → billing → delivery) plus exception
-  and route-change variants.
-- Auth: customer tokens cannot hit staff APIs; staff role guards reject the
-  wrong operational role.
+## Foot-guns (read before editing)
 
-## Known Foot-guns
+- `LaundryOrder.customer_id` is a UUID PK. Ownership checks must traverse `order.customer.customerId`.
+- `tagItem`, `assignRoute`, `scanStep` each perform two separate DB writes (route-engine tx + item-status update). Inconsistent state on failure between them is an accepted MVP risk; do not rely on atomicity across the two.
+- `npx prisma db seed` works (the `prisma.seed` block in `package.json` was added). `npm run prisma:seed` is the explicit alias.
+- The `_test` DB safety gate is in [test/load-env.ts](../../test/load-env.ts). Never bypass it.
 
-- `LaundryOrder.customer_id` is a UUID PK, **not** the human `customerId`.
-  Ownership checks (billing, exception, route-change) must traverse
-  `order.customer.customerId`. A past 403 bug came from this confusion.
-- `tagItem`, `assignRoute`, and `scanStep` each do two separate writes
-  (route-engine tx + item-status update). Inconsistent state on failure is
-  an accepted MVP risk.
-- Seeding: both `npx prisma db seed` and `npm run prisma:seed` work; the
-  former is wired via the `prisma.seed` block in `package.json`.
+## When you change this file
+
+- New rule → add a row to one of the tables above. Do not write paragraphs.
+- Removing a rule that has tests → also remove the tests, or migrate them.

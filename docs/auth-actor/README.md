@@ -1,64 +1,72 @@
-# Auth / Customer / Staff
+# Auth / Actor
 
-## Goal
+`src/modules/auth/`
 
-Customer identity and staff identity are kept separate — they have different
-profile requirements, access rules, and likely different real-auth paths
-later. The MVP never combines them into a single `Actor`.
+## Subjects (disjoint — never merged)
 
-## Subjects
-
-`Customer` (`customers` table): `customerId`, optional `phoneNumber`, optional `address`.
-`Staff` (`staff` table): `staffId`, `role`, optional `displayName`, optional `phoneNumber`.
+| Subject | Table | Identifier | Required profile |
+|---|---|---|---|
+| Customer | `customers` | `customerId` (string, unique) | `phoneNumber`, `address` (both required for order flows) |
+| Staff | `staff` | `staffId` (string, unique) + `role` | `displayName` optional |
 
 Staff roles (`StaffRole` enum): `PICKUP`, `WASH`, `DELIVERY`, `ADMIN`.
 
-Profile completion is required for customers (phone + address) before
-workflows that need contact/address info. Staff have no profile completion
-requirement in the MVP.
+## Token payloads
 
-## Token Payload
+```ts
+// Customer
+{ subjectType: 'CUSTOMER', customerId: string }
 
-Customer:
-```json
-{ "subjectType": "CUSTOMER", "customerId": "customer-1" }
+// Staff
+{ subjectType: 'STAFF', staffId: string, staffRole: StaffRole }
 ```
 
-Staff:
-```json
-{ "subjectType": "STAFF", "staffId": "staff-1", "staffRole": "PICKUP" }
-```
+JWT signed with `JWT_SECRET`. No password flow in MVP.
 
-## API
+## Endpoints
 
-| Method | Path | Notes |
-|---|---|---|
-| `POST` | `/auth/customer/dev-login` | Body `{ customerId }`. Response includes `requiresProfileCompletion` and `missingFields` when phone/address missing. |
-| `PATCH` | `/auth/customer/me/profile` | Body `{ phoneNumber, address }` |
-| `POST` | `/auth/staff/pickup/dev-login` | Endpoint path determines the role — body must NOT carry a role. |
-| `POST` | `/auth/staff/wash/dev-login` | |
-| `POST` | `/auth/staff/delivery/dev-login` | |
-| `POST` | `/auth/staff/admin/dev-login` | |
-
-No real password/PG flow in the MVP. `dev-login` upserts the subject record.
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| `POST` | `/auth/customer/dev-login` | `{ customerId }` | Upserts `customers` row. Response includes `requiresProfileCompletion` + `missingFields` |
+| `PATCH` | `/auth/customer/me/profile` | `{ phoneNumber, address }` | Customer token required |
+| `POST` | `/auth/staff/pickup/dev-login` | `{ staffId }` | Role determined by path, **not** body |
+| `POST` | `/auth/staff/wash/dev-login` | `{ staffId }` | |
+| `POST` | `/auth/staff/delivery/dev-login` | `{ staffId }` | |
+| `POST` | `/auth/staff/admin/dev-login` | `{ staffId }` | |
 
 ## Guards
 
-- `CustomerAuthGuard` for customer endpoints; injects `CurrentCustomer`.
-- `StaffAuthGuard` + `@StaffRoles(...)` for staff endpoints; injects `CurrentStaff`.
-- `CurrentPrincipal` exists only at the auth boundary — use cases receive the
-  concrete `CustomerPrincipal` or `StaffPrincipal`.
+| Guard | Decorator | Injects | Defined in |
+|---|---|---|---|
+| `CustomerAuthGuard` | — | `CustomerPrincipal` via `@CurrentCustomer()` | `src/common/auth/customer-auth.guard.ts` |
+| `StaffAuthGuard` | `@StaffRoles('WASH', 'ADMIN', ...)` | `StaffPrincipal` via `@CurrentStaff()` | `src/common/auth/staff-auth.guard.ts` |
 
-## Access Summary
+## Access rules (enforced by guards)
 
-- Customer-only: order creation, profile update, pricing estimate, billing pay/cancel, approval/route-change responses.
-- `PICKUP` (or `ADMIN`): pickup APIs.
-- `WASH` (or `ADMIN`): wash APIs, raise-issue, activate-exception-flow, request-route-change.
-- `DELIVERY` (or `ADMIN`): delivery APIs.
-- `ADMIN`: audit-log read.
+| Resource class | Required |
+|---|---|
+| Customer-only (orders, profile, billing pay/cancel, approval respond, route-change approve/reject) | `CustomerAuthGuard` |
+| Pickup APIs | `StaffAuthGuard` + `@StaffRoles('PICKUP')` |
+| Wash APIs | `StaffAuthGuard` + `@StaffRoles('WASH')` |
+| Delivery APIs | `StaffAuthGuard` + `@StaffRoles('DELIVERY')` |
+| `/audit-logs` | `StaffAuthGuard` + `@StaffRoles('ADMIN')` |
 
-## Actor Snapshot
+## Invariants
 
-`AuditLog` and `ItemProcessEvent` store the principal as
-`{ actorType, actorId, staffRole? }`. Customer rows have `staffRole = null`;
-staff rows include the role used for authorization.
+- Never mix `CustomerAuthGuard` and `StaffAuthGuard` on the same endpoint.
+- Customer ownership checks traverse `<entity>.order.customer.customerId === requesting.customerId`. **Never** compare to `order.customer_id` (UUID PK).
+- WS auth uses `socket.handshake.auth.token` (Bearer JWT) and joins room `customer:${customerId}`. Bad token → `client.disconnect()`.
+
+## Actor snapshot (used by audit + process events)
+
+```ts
+{ actorType: 'CUSTOMER' | 'STAFF', actorId: string, staffRole: StaffRole | null }
+```
+- Customer actions: `actorType='CUSTOMER'`, `staffRole=null`.
+- Staff actions: `actorType='STAFF'`, `staffRole=<the role used for auth>`.
+
+## When you change this domain
+
+- Add a new staff role → update `StaffRole` enum (Prisma) + migration + guards' role checks + this README's role table.
+- Add a customer profile requirement → update `complete-customer-profile.use-case.ts` + `requiresProfileCompletion` logic in dev-login + this README.
+- Add a new principal field → update token signing in `customer-dev-login.use-case.ts` / `staff-dev-login.use-case.ts`, the principal type in `src/common/auth/current-principal.ts`, both guards, and both WS gateways.

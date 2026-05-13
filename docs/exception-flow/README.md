@@ -1,111 +1,101 @@
 # Exception Flow
 
-The exception domain covers two mid-process customer-facing flows:
+`src/modules/exception/` — two mid-process customer-facing flows: **override flows** (in-place detour on the current route) and **route changes** (full plan replacement).
 
-1. **Override flows** — small detours that materialize as
-   `item_processing_overrides` rows on top of the current route (repair
-   approval, vendor approval, premium notice, rewash, …).
-2. **Route changes** — full replacement of the active processing route
-   (`switchRoute`), gated by customer approval and optional supplemental
-   billing.
+## Tables (owned)
+- `exception_flow_templates`, `exception_flow_template_steps` (templates, seeded)
+- `item_issues`, `approval_requests`, `item_exception_contexts`
+- `route_change_requests`
+- `item_processing_overrides` (read+write by both this domain and `RouteEngineService.findNextStep`)
 
-## Override Flow
+## Two flows
 
-### Templates
-
-`exception_flow_templates` + `exception_flow_template_steps` (relative
-`offset` per step). Seed includes flows such as `REPAIR_APPROVAL_FLOW`,
-`VENDOR_APPROVAL_FLOW`, `PREMIUM_APPROVAL_FLOW`, `REWASH_FLOW`,
-`ADDITIONAL_REPAIR_FLOW`, …
-
-### Override Row Model
-
-Each ACTIVE override row represents one in-flight exception flow on an item.
-The row carries its current position (`flowCode`, `currentOffset`,
-`stepType`, `sortOrder`, `displayName`, `baseStepSortOrder`) and advances
-**in-place** as the operator scans through the template's steps. Multiple
-ACTIVE overrides per item are allowed (stacked) and resolve in `sortOrder`
-order — see `findNextStep` in
-[../processing-route/README.md](../processing-route/README.md#step-advancement--findnextstep).
-
-Override `status`:
-- `ACTIVE` — currently advancing through its template.
-- `COMPLETED` — last template step done.
-- `SUPERSEDED` — skipped by `skipRemainingOverrides` (e.g. customer chose
-  `CLEAN_WITHOUT_REPAIR`).
-
-### Item Issues + Approval Requests
-
-- `item_issues` records that a problem was raised (no state change on its own).
-- `approval_requests` is the customer-facing decision request; emitted when a
-  flow contains a `WAIT_CUSTOMER_DECISION` step and resolved via the
-  customer-side respond endpoint.
-
-### API
-
-| Method | Path | Guard | Role |
-|---|---|---|---|
-| `POST` | `/wash/items/:id/raise-issue` | Staff | `WASH` |
-| `POST` | `/wash/items/:id/activate-exception-flow` | Staff | `WASH` |
-| `GET` | `/wash/approval-requests` | Customer | — (returns the customer's pending requests; used for socket-reconnect recovery) |
-| `POST` | `/wash/approval-requests/:id/respond` | Customer | — |
-
-`activate-exception-flow` body: `{ flowCode }`. Loads the template, computes
-`baseStepSortOrder` from the current ROUTE step, creates the override row,
-flips state to `OVERRIDE`, and emits `STEP_STARTED`. If the template includes
-`WAIT_CUSTOMER_DECISION`, an `ApprovalRequest` is created and a socket event
-is pushed.
-
-While the current override step is `WAIT_CUSTOMER_DECISION`, the wash domain
-blocks further scans on this item with `409 ItemAwaitingCustomerDecision`.
-
-`respond` body: `{ decision, extraAmount? }`. Decision handling:
-
-| Decision | Effect |
-|---|---|
-| `APPROVE_REPAIR` / `APPROVE_VENDOR` / `APPROVE_PREMIUM` | Advance the current OVERRIDE step. If `extraAmount > 0`, create a SUPPLEMENT billing request. |
-| `CLEAN_WITHOUT_REPAIR` / `APPROVE_AS_IS` | Mark remaining overrides `SUPERSEDED`, return to ROUTE. |
-| `RETURN_WITHOUT_PROCESSING` | Mark remaining overrides `SUPERSEDED` and resolve exception context. |
-
-Ownership check on `respond`: traverse
-`approvalRequest.orderItem.order.customer.customerId` — never compare against
-`order.customer_id` (UUID PK foot-gun).
-
-## Route Change Flow
-
-When the operator decides the item belongs on a different route entirely
-(e.g. discovered repair need → switch from `GENERAL_CLOTHES_CLEANING` to
-`REPAIR_AND_CLEANING`), they raise a `RouteChangeRequest`. The customer
-approves or rejects. On approval, `RouteEngineService.switchRoute` runs:
-current plan → `SUPERSEDED`, new plan → `ACTIVE`.
-
-### API
-
-| Method | Path | Guard | Role |
-|---|---|---|---|
-| `POST` | `/wash/items/:id/request-route-change` | Staff | `WASH` |
-| `GET` | `/wash/route-change-requests/pending` | Customer | — (the customer's PENDING requests) |
-| `POST` | `/wash/route-change-requests/:id/approve` | Customer | — |
-| `POST` | `/wash/route-change-requests/:id/reject` | Customer | — |
-
-`request-route-change` body: `{ toRouteCode, additionalCost?, reason }`. The
-catalog item's default route (auto-resolved from item + options at order
-creation) provides the typical starting route; route-change is the path for
-changing it after tagging.
-
-While a `RouteChangeRequest` is PENDING on an item, `scan-step` is blocked
-with `409 ItemHasPendingRouteChange`. On approve, `additionalCost > 0`
-creates a SUPPLEMENT billing.
-
-## WebSocket — `/exception`
-
-- Auth: `socket.handshake.auth.token` (Bearer JWT, CUSTOMER subject).
-- Room: `customer:${customerId}`.
-
-| Event | Direction | Payload |
+| Flow | Trigger state | Side effects |
 |---|---|---|
-| `exception:approval-requested` | server → client | `{ approvalRequestId, flowCode, itemId, options }` |
-| `exception:approval-resolved` | server → client | `{ approvalRequestId, decision, orderItemId }` |
+| Override | `WashSide`: `request-route-change` is **not** allowed; activate-exception-flow needs item `SORTED` or `PROCESSING` | Inserts an `item_processing_overrides` ACTIVE row; flips state source to OVERRIDE; emits `STEP_STARTED`; if template has `WAIT_CUSTOMER_DECISION`, creates `approval_requests` row + WS push |
+| Route change | item `SORTED` or `PROCESSING`; no PENDING route change exists; state source is not OVERRIDE | Inserts `route_change_requests` PENDING; WS push to customer |
 
-Route-change requests reuse approval-request semantics — see the controller
-for current event names if you wire frontend listeners.
+## Override step model
+
+One ACTIVE override row per running flow on an item. The row advances **in place** as the operator scans through the template:
+- `flowCode` — template code
+- `currentOffset` — current position within template
+- `stepType`, `displayName`, `sortOrder` — denormalized for `findNextStep`
+- `baseStepSortOrder` — the ROUTE step at which the override was inserted
+- `status` — `ACTIVE` | `COMPLETED` | `SUPERSEDED`
+
+Multiple ACTIVE overrides stack on the same item — resolved by `findNextStep` (see [processing-route](../processing-route/README.md#findnextstep-algorithm)).
+
+## Approval decisions
+
+| decision | Effect |
+|---|---|
+| `APPROVE_REPAIR` / `APPROVE_VENDOR` / `APPROVE_PREMIUM` | `RouteEngineService.completeCurrentStep` (advances OVERRIDE). If `extraAmount > 0`, `BillingService.createSupplementBillingForApproval` (SUPPLEMENT, `notifiedAt=null`) |
+| `CLEAN_WITHOUT_REPAIR` / `APPROVE_AS_IS` | `RouteEngineService.skipRemainingOverrides` (drops remaining override; returns to ROUTE); resolve `item_exception_contexts` |
+| `RETURN_WITHOUT_PROCESSING` | Same as above — skip remaining + resolve context |
+
+## Route-change approve decision
+
+| Effect | Where |
+|---|---|
+| CAS `route_change_requests` PENDING → APPROVED | top of `ApproveRouteChangeUseCase` |
+| `RouteEngineService.switchRoute` (current plan SUPERSEDED, new ACTIVE plan) | `ApproveRouteChangeUseCase` |
+| `orderItemOption` swap of `cleaning_method` (matches new route via `ROUTE_CLEANING_METHOD` map) | `ApproveRouteChangeUseCase` |
+| `BillingService.createSupplementBillingForRouteChange` if `additionalCost !== 0` | `ApproveRouteChangeUseCase` |
+| `orderItem.estimatedMinAmount += additionalCost` | `ApproveRouteChangeUseCase` — **running total for wash-web's next-route-change form math**, not the BASE billed amount |
+
+## Endpoints
+
+| Method | Path | Guard | Notes |
+|---|---|---|---|
+| `POST` | `/wash/items/:id/raise-issue` | Staff `WASH` | Records `item_issues` row only; no state change |
+| `POST` | `/wash/items/:id/activate-exception-flow` | Staff `WASH` | `{ flowCode }` — creates override + optional approval request |
+| `GET` | `/wash/approval-requests` | Customer | Customer's WAITING approval requests (reconnect-recovery) |
+| `POST` | `/wash/approval-requests/:id/respond` | Customer | `{ decision, extraAmount? }` |
+| `POST` | `/wash/items/:id/request-route-change` | Staff `WASH` | `{ toRouteCode, additionalCost?, reason }` |
+| `GET` | `/wash/route-change-requests/pending` | Customer | Customer's PENDING route-change requests (reconnect-recovery) |
+| `POST` | `/wash/route-change-requests/:id/approve` | Customer | |
+| `POST` | `/wash/route-change-requests/:id/reject` | Customer | Records REJECTED status only; no plan/billing side effect |
+
+## Scan-step blockers
+
+When the wash domain's `scan-step` runs, it queries this domain:
+
+| Condition | Throws |
+|---|---|
+| Current step is `WAIT_CUSTOMER_DECISION` (override) | `ItemAwaitingCustomerDecision` (409) |
+| `route_change_requests` row exists with `status='PENDING'` for this item | `ItemHasPendingRouteChange` (409) |
+
+## WebSocket
+
+Namespace `/exception`. Room `customer:${customerId}`.
+
+| Event | Direction | Payload | Trigger |
+|---|---|---|---|
+| `exception:approval-requested` | server → client | `{ approvalRequestId, flowCode, itemId, options, additionalCost? }` | `activate-exception-flow` when template has `WAIT_CUSTOMER_DECISION` |
+| `exception:approval-resolved` | server → client + wash staff broadcast | `{ approvalRequestId, decision, orderItemId }` | `respond-approval` |
+| `exception:route-change-requested` | server → client | `{ routeChangeRequestId, itemId, fromRouteCode, toRouteCode, additionalCost, reason }` | `request-route-change` |
+| `exception:route-change-resolved` | server → wash staff broadcast | `{ routeChangeRequestId, orderItemId, status }` | `approve-route-change` / `reject-route-change` |
+
+## Race / idempotency guarantees
+
+| Risk | Protection |
+|---|---|
+| Approval double-fire | CAS in `RespondApprovalUseCase`: `updateMany WHERE status='WAITING'` + throw on `count===0` |
+| Route-change approve double-fire | CAS in `ApproveRouteChangeUseCase`: `updateMany WHERE status='PENDING'` + throw on `count===0` |
+| SUPPLEMENT duplicate creation | `BillingRequest` `UNIQUE(sourceType, sourceId)` ([billing](../billing/README.md)) |
+| Concurrent override mutations | `loadState` `SELECT ... FOR UPDATE` in `RouteEngineService` |
+
+## Seed templates (11)
+
+`REPAIR_APPROVAL_FLOW`, `VENDOR_APPROVAL_FLOW`, `PREMIUM_APPROVAL_FLOW`, `REWASH_FLOW`, `ADDITIONAL_REPAIR_FLOW`, `ADDITIONAL_VENDOR_FLOW`, `DAMAGE_RISK_APPROVAL_FLOW`, `STAIN_REMOVAL_FAILED_FLOW`, `PAYMENT_FAILED_FLOW`, `PAYMENT_PENDING_FLOW`, `RETURN_WITHOUT_PROCESSING_FLOW`. Step types are free-form strings — meaning lives in `prisma/seed.ts`.
+
+## Anti-pattern
+
+- **Do not use `REPAIR_APPROVAL_FLOW` in tests that need to scan past the approval step.** The seed has two consecutive `WAIT_CUSTOMER_DECISION` steps; a single approval response advances to the second, and `scan-step` blocks on the second. Use route-change for SUPPLEMENT-creation tests instead.
+
+## When you change this domain
+
+- New flow template → seed in `prisma/seed.ts` + add to the list above. Step types are strings; no migration needed.
+- New approval decision → update `APPROVE_DECISIONS` / `SKIP_DECISIONS` sets in `RespondApprovalUseCase` + this README's decision table.
+- New side effect on approve → update the side-effect table; if it touches billing, also update [billing/README.md](../billing/README.md).

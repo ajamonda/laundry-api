@@ -1,65 +1,69 @@
 # Audit / Event
 
-Two append-only tables capture who-did-what across the system:
+Cross-domain bookkeeping. No dedicated module — `AuditLogger` lives in `processing-route` and is injected everywhere else.
 
-- **`audit_logs`** — general operational audit, written by every business
-  state change. Queried by `(targetType, targetId)` or by actor.
-- **`item_process_events`** — per-item processing timeline (plan/step
-  lifecycle), surfaced to staff/customer UIs.
+## Tables (owned)
+- `audit_logs` — general business audit
+- `item_process_events` — per-item processing timeline (plan/step lifecycle)
 
-A single business action typically writes both rows in the same transaction.
+A single business action typically writes both. Different consumers:
 
-## Actor Snapshot
+| Table | Read by |
+|---|---|
+| `audit_logs` | Admin tooling, compliance queries; `GET /audit-logs` (ADMIN) |
+| `item_process_events` | Staff/customer item timeline view; `GET /items/:id/processing/events` (WASH) |
 
-Both tables share the actor shape:
+## Actor snapshot (shared shape)
 
 ```ts
 { actorType: 'CUSTOMER' | 'STAFF', actorId: string, staffRole: StaffRole | null }
 ```
+- Customer rows: `staffRole = null`.
+- Staff rows: `staffRole = <role used by the auth guard>`.
 
-Customer rows have `staffRole = null`; staff rows carry the role used for
-authorization. `actionType` and `targetType` on `audit_logs` are free-form
-strings (intentionally, so each domain can register its own keywords without
-a schema migration).
+## `actionType` / `targetType`
 
-## `AuditLogger`
+Both are free-form strings. Each domain registers its own keywords without schema migration. **Authoritative list per domain README.**
 
-Implemented at `src/modules/processing-route/domain/audit-logger.ts` and
-exported from `ProcessingRouteModule`. Other domains inject it directly —
-they do not own audit infrastructure.
+## Required usage
+
+Every state mutation that owns a business meaning writes an audit row in the same transaction:
 
 ```ts
-auditLogger.logInTransaction(tx, {
+await this.auditLogger.logInTransaction(tx, {
   actor,
-  actionType,    // e.g. 'PLAN_CREATED', 'ITEM_TAGGED', 'BILLING_PAID'
-  targetType,    // e.g. 'ORDER_ITEM', 'BILLING_REQUEST'
-  targetId,
-  beforeState?,  // JSONB
-  afterState?,   // JSONB
-  reason?,
-  metadata?,
+  actionType: 'ITEM_TAGGED',
+  targetType: 'ORDER_ITEM',
+  targetId: orderItemId,
+  beforeState: { status: 'PICK_UP' },
+  afterState:  { status: 'TAGGED', tagBarcode },
 });
 ```
 
-The caller always passes its own `Prisma.TransactionClient` so the audit row
-is atomic with the business write.
+**Never** call `AuditLogger.logInTransaction` outside a `$transaction`. The whole point is atomicity with the business write.
 
-## API
+## Coverage matrix
 
-| Method | Path | Guard |
+| Domain | Writes audit_logs? | Writes item_process_events? |
 |---|---|---|
-| `GET` | `/audit-logs?targetType=&targetId=&actorId=&limit=&cursor=` | Staff, `ADMIN` only |
+| catalog | (order creation events via processing-route `createPlan`) | yes (via `createPlan`) |
+| pickup | yes (`ITEM_PICKED_UP`, `ITEMS_PUT_INTO_BAG`, `BAG_HANDED_OFF`, etc.) | no |
+| processing-route | yes (`PLAN_CREATED`, `STEP_COMPLETED`, `OVERRIDE_ACTIVATED`, `PLAN_SUPERSEDED`, etc.) | yes (the timeline source) |
+| wash | yes (`ITEM_TAGGED`) | indirect via `RouteEngineService` |
+| exception | yes (via `RouteEngineService` calls) | yes (via `RouteEngineService` calls) |
+| billing | yes (`BILLING_CREATED`, `BILLING_PAID`, `BILLING_CANCELLED`) — emitted as `payment_events` rows, separate stream | no |
+| delivery | yes (`ITEM_SCAN_OUTBOUND`, `ITEM_HANDED_OFF`) | no |
 
-Cursor is the ISO timestamp of the last row; ordered by `timestamp DESC`.
+Note: `payment_events` is a billing-domain timeline table, not `audit_logs`. The general audit log records the action; `payment_events` records the side stream that the billing UI/state machine consumes.
 
-## Coverage
+## Read endpoint
 
-- `RouteEngineService` writes AuditLog rows for `createPlan`,
-  `completeCurrentStep`, `activateOverrides`, `skipRemainingOverrides`,
-  `switchRoute`.
-- `WashModule` writes for `tag-item`, `assign-route`, `scan-step`,
-  `packages`.
-- `BillingModule`, `ExceptionModule`, `DeliveryModule`, `PickupModule` each
-  write for their own business actions.
-- Failed validation must not produce a successful audit row — write in the
-  same transaction as the state change.
+| Method | Path | Guard | Notes |
+|---|---|---|---|
+| `GET` | `/audit-logs?targetType=&targetId=&actorId=&limit=&cursor=` | StaffAuthGuard, `ADMIN` | cursor = ISO timestamp of last row; `timestamp DESC` |
+
+## When you change this domain
+
+- Adding a new `AuditLog` action emitter → list the keyword in the emitter's domain README. Don't track it here.
+- Schema change to `audit_logs` or `item_process_events` → update [processing-route/README.md](../processing-route/README.md) (the engine owns the events) + migration + seed if applicable.
+- New consumer of audit data → cursor pagination is the only supported access pattern; do not add unfiltered `findMany`.
