@@ -1,0 +1,851 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StaffRole {
+  PICKUP
+  WASH
+  DELIVERY
+  ADMIN
+}
+
+enum CatalogSelectionType {
+  SINGLE
+  MULTI
+}
+
+enum CatalogInputType {
+  TEXT
+  NUMBER
+}
+
+enum CatalogPriceType {
+  FIXED
+  RANGE
+  UNIT
+  MATRIX
+  NONE
+}
+
+enum OrderStatus {
+  REQUEST
+  PICK_UP
+  PROCESSING
+  PARTIAL_FINISHED
+  FINISHED
+}
+
+enum OrderItemStatus {
+  INIT
+  PICK_UP
+  TAGGED
+  SORTED
+  PROCESSING
+  READY_TO_PACKAGE
+  READY_FOR_DELIVERY
+  DELIVERING
+  FINISHED
+}
+
+enum OrderItemLocation {
+  CUSTOMER_PICK_UP
+  PICK_UP_TRUCK
+  IN_HOUSE
+  PREMIUM
+  VENDOR
+  DELIVERING_TRUCK
+  CUSTOMER_DEST
+}
+
+enum FulfillmentType {
+  DELIVERY
+  STORAGE
+}
+
+enum PickupRunStatus {
+  ACTIVE
+  RETURNED
+}
+
+enum PickupBagStatus {
+  READY
+  TAKE_OUT
+  CONTAIN
+  TAKE_BACK
+}
+
+enum ProcessingPlanStatus {
+  ACTIVE
+  SUPERSEDED
+}
+
+enum ProcessingStepSource {
+  ROUTE
+  OVERRIDE
+}
+
+enum ProcessingStepStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum ItemProcessEventType {
+  PLAN_CREATED
+  PLAN_SUPERSEDED
+  PLAN_COMPLETED
+  STEP_STARTED
+  STEP_COMPLETED
+}
+
+enum ActorType {
+  CUSTOMER
+  STAFF
+}
+
+model Customer {
+  id          String         @id @default(uuid())
+  customerId  String         @unique @map("customer_id")
+  phoneNumber String?        @map("phone_number")
+  address     String?
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+  orders      LaundryOrder[]
+
+  @@map("customers")
+}
+
+model Staff {
+  id          String    @id @default(uuid())
+  staffId     String    @unique @map("staff_id")
+  role        StaffRole
+  displayName String?   @map("display_name")
+  phoneNumber String?   @map("phone_number")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  pickupRuns   PickupRun[]
+  pickupPhotos PickupPhoto[]
+
+  @@map("staff")
+}
+
+model PickupVehicle {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  displayName String   @map("display_name")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  runs PickupRun[]
+
+  @@map("pickup_vehicles")
+}
+
+model PickupRun {
+  id        String          @id @default(uuid())
+  vehicleId String          @map("vehicle_id")
+  staffId   String          @map("staff_id")
+  status    PickupRunStatus @default(ACTIVE)
+  startedAt DateTime        @default(now()) @map("started_at")
+  endedAt   DateTime?       @map("ended_at")
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+
+  vehicle PickupVehicle @relation(fields: [vehicleId], references: [id])
+  staff   Staff         @relation(fields: [staffId], references: [staffId])
+  bags    PickupBag[]
+  photos  PickupPhoto[]
+  items   PickupBagItem[]
+
+  @@index([staffId, status])
+  @@index([vehicleId, status])
+  @@map("pickup_runs")
+}
+
+model PickupBag {
+  id           String          @id @default(uuid())
+  barcode      String          @unique
+  status       PickupBagStatus @default(READY)
+  active       Boolean         @default(true)
+  currentRunId String?         @map("current_run_id")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  currentRun PickupRun?      @relation(fields: [currentRunId], references: [id])
+  items      PickupBagItem[]
+
+  @@index([currentRunId, status])
+  @@map("pickup_bags")
+}
+
+model PickupBagItem {
+  id          String   @id @default(uuid())
+  pickupBagId String   @map("pickup_bag_id")
+  pickupRunId String   @map("pickup_run_id")
+  orderId     String   @map("order_id")
+  orderItemId String   @unique @map("order_item_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  pickupBag PickupBag    @relation(fields: [pickupBagId], references: [id])
+  pickupRun PickupRun    @relation(fields: [pickupRunId], references: [id])
+  order     LaundryOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem OrderItem    @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([pickupBagId])
+  @@index([pickupRunId])
+  @@index([orderId])
+  @@map("pickup_bag_items")
+}
+
+model PickupPhoto {
+  id          String   @id @default(uuid())
+  orderId     String   @map("order_id")
+  pickupRunId String   @map("pickup_run_id")
+  staffId     String   @map("staff_id")
+  photoUrl    String   @map("photo_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  order     LaundryOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  pickupRun PickupRun    @relation(fields: [pickupRunId], references: [id])
+  staff     Staff        @relation(fields: [staffId], references: [staffId])
+
+  @@index([orderId, pickupRunId])
+  @@map("pickup_photos")
+}
+
+model CatalogItem {
+  id                   String  @id @default(uuid())
+  code                 String  @unique
+  displayName          String  @map("display_name")
+  description          String?
+  photoRequired        Boolean @default(false) @map("photo_required")
+  processingRouteCode  String? @map("processing_route_code")
+  active               Boolean @default(true)
+  sortOrder            Int     @default(0) @map("sort_order")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  optionGroups       CatalogOptionGroup[]
+  inputs             CatalogItemInput[]
+  orderItems         OrderItem[]
+  catalogOptionRules CatalogOptionRule[]
+
+  @@map("catalog_items")
+}
+
+model CatalogOptionGroup {
+  id            String               @id @default(uuid())
+  catalogItemId String               @map("catalog_item_id")
+  code          String
+  displayName   String               @map("display_name")
+  selectionType CatalogSelectionType @map("selection_type")
+  required      Boolean              @default(false)
+  minSelect     Int?                 @map("min_select")
+  maxSelect     Int?                 @map("max_select")
+  sortOrder     Int                  @default(0) @map("sort_order")
+  active        Boolean              @default(true)
+  createdAt     DateTime             @default(now()) @map("created_at")
+  updatedAt     DateTime             @updatedAt @map("updated_at")
+
+  catalogItem      CatalogItem         @relation(fields: [catalogItemId], references: [id], onDelete: Cascade)
+  options          CatalogOption[]
+  rules            CatalogOptionRule[]
+  orderItemOptions OrderItemOption[]
+
+  @@unique([catalogItemId, code])
+  @@map("catalog_option_groups")
+}
+
+model CatalogOption {
+  id                   String            @id @default(uuid())
+  catalogOptionGroupId String            @map("catalog_option_group_id")
+  parentOptionId       String?           @map("parent_option_id")
+  code                 String
+  displayName          String            @map("display_name")
+  description          String?
+  requiresInput        Boolean           @default(false) @map("requires_input")
+  inputType            CatalogInputType? @map("input_type")
+  inputUnit            String?           @map("input_unit")
+  sortOrder            Int               @default(0) @map("sort_order")
+  active               Boolean           @default(true)
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @updatedAt @map("updated_at")
+
+  optionGroup      CatalogOptionGroup   @relation(fields: [catalogOptionGroupId], references: [id], onDelete: Cascade)
+  parent           CatalogOption?       @relation("CatalogOptionChildren", fields: [parentOptionId], references: [id])
+  children         CatalogOption[]      @relation("CatalogOptionChildren")
+  prices           CatalogOptionPrice[]
+  rules            CatalogOptionRule[]
+  orderItemOptions OrderItemOption[]
+
+  @@unique([catalogOptionGroupId, code, parentOptionId])
+  @@map("catalog_options")
+}
+
+model CatalogOptionPrice {
+  id                String           @id @default(uuid())
+  catalogOptionId   String           @map("catalog_option_id")
+  priceType         CatalogPriceType @map("price_type")
+  currency          String           @default("KRW")
+  amount            Int?
+  minAmount         Int?             @map("min_amount")
+  maxAmount         Int?             @map("max_amount")
+  baseAmount        Int?             @map("base_amount")
+  baseQuantity      Decimal?         @map("base_quantity") @db.Decimal(10, 2)
+  baseUnit          String?          @map("base_unit")
+  extraUnitQuantity Decimal?         @map("extra_unit_quantity") @db.Decimal(10, 2)
+  extraUnitAmount   Int?             @map("extra_unit_amount")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  catalogOption CatalogOption @relation(fields: [catalogOptionId], references: [id], onDelete: Cascade)
+
+  @@map("catalog_option_prices")
+}
+
+model CatalogOptionRule {
+  id                   String   @id @default(uuid())
+  catalogItemId        String   @map("catalog_item_id")
+  catalogOptionGroupId String?  @map("catalog_option_group_id")
+  catalogOptionId      String?  @map("catalog_option_id")
+  ruleType             String   @map("rule_type")
+  conditionGroupCode   String?  @map("condition_group_code")
+  conditionOptionCode  String?  @map("condition_option_code")
+  targetGroupCode      String?  @map("target_group_code")
+  targetOptionCode     String?  @map("target_option_code")
+  required             Boolean  @default(false)
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  catalogItem        CatalogItem         @relation(fields: [catalogItemId], references: [id], onDelete: Cascade)
+  catalogOptionGroup CatalogOptionGroup? @relation(fields: [catalogOptionGroupId], references: [id])
+  catalogOption      CatalogOption?      @relation(fields: [catalogOptionId], references: [id])
+
+  @@map("catalog_option_rules")
+}
+
+model CatalogItemInput {
+  id            String           @id @default(uuid())
+  catalogItemId String           @map("catalog_item_id")
+  code          String
+  displayName   String           @map("display_name")
+  inputType     CatalogInputType @map("input_type")
+  required      Boolean          @default(false)
+  sortOrder     Int              @default(0) @map("sort_order")
+  active        Boolean          @default(true)
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  catalogItem CatalogItem @relation(fields: [catalogItemId], references: [id], onDelete: Cascade)
+
+  @@unique([catalogItemId, code])
+  @@map("catalog_item_inputs")
+}
+
+model OrderRequestOption {
+  id             String            @id @default(uuid())
+  code           String
+  displayName    String            @map("display_name")
+  groupCode      String            @map("group_code")
+  parentOptionId String?           @map("parent_option_id")
+  requiresInput  Boolean           @default(false) @map("requires_input")
+  inputType      CatalogInputType? @map("input_type")
+  sortOrder      Int               @default(0) @map("sort_order")
+  active         Boolean           @default(true)
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  parent   OrderRequestOption?  @relation("OrderRequestOptionChildren", fields: [parentOptionId], references: [id])
+  children OrderRequestOption[] @relation("OrderRequestOptionChildren")
+
+  @@unique([groupCode, code, parentOptionId])
+  @@map("order_request_options")
+}
+
+model LaundryOrder {
+  id                        String           @id @default(uuid())
+  customerId                String           @map("customer_id")
+  status                    OrderStatus      @default(REQUEST)
+  pickupSchedule            DateTime?        @map("pickup_schedule")
+  fulfillmentType           FulfillmentType? @map("fulfillment_type")
+  fulfillmentOptionCode     String?          @map("fulfillment_option_code")
+  address                   String?
+  phoneNumber               String?          @map("phone_number")
+  pickupDeliveryPlaceCode   String?          @map("pickup_delivery_place_code")
+  pickupDeliveryPlaceText   String?          @map("pickup_delivery_place_text")
+  secondHandPickupRequested Boolean          @default(false) @map("second_hand_pickup_requested")
+  estimatedMinAmount        Int              @default(0) @map("estimated_min_amount")
+  estimatedMaxAmount        Int              @default(0) @map("estimated_max_amount")
+  finalAmount               Int?             @map("final_amount")
+  createdAt                 DateTime         @default(now()) @map("created_at")
+  updatedAt                 DateTime         @updatedAt @map("updated_at")
+
+  customer       Customer              @relation(fields: [customerId], references: [id])
+  items          OrderItem[]
+  pickupBagItems PickupBagItem[]
+  pickupPhotos   PickupPhoto[]
+  billingRequests BillingRequest[]
+  packages        ItemPackage[]
+
+  @@index([status, pickupSchedule, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                  String            @id @default(uuid())
+  orderId             String            @map("order_id")
+  catalogItemId       String            @map("catalog_item_id")
+  catalogItemCode     String            @map("catalog_item_code")
+  displayNameSnapshot String            @map("display_name_snapshot")
+  status              OrderItemStatus   @default(INIT)
+  location            OrderItemLocation @default(CUSTOMER_PICK_UP)
+  tagBarcode          String?           @unique @map("tag_barcode")
+  estimatedMinAmount  Int               @default(0) @map("estimated_min_amount")
+  estimatedMaxAmount  Int               @default(0) @map("estimated_max_amount")
+  finalAmount         Int?              @map("final_amount")
+  packageId           String?           @map("package_id")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  order           LaundryOrder             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  catalogItem     CatalogItem              @relation(fields: [catalogItemId], references: [id])
+  options         OrderItemOption[]
+  inputs          OrderItemInput[]
+  photos          OrderItemPhoto[]
+  priceSnapshots  OrderItemPriceSnapshot[]
+  pickupBagItem   PickupBagItem?
+  processingPlans  ItemProcessingPlan[]
+  processingState  ItemProcessingState?
+  processEvents    ItemProcessEvent[]
+  issues           ItemIssue[]
+  approvalRequests ApprovalRequest[]
+  billingItem      BillingRequestItem?
+  deliveryRunItem  DeliveryRunItem?
+  overrides        ItemProcessingOverride[]
+  exceptionContext ItemExceptionContext?
+  package          ItemPackage?             @relation(fields: [packageId], references: [id])
+  routeChangeRequests RouteChangeRequest[]
+
+  @@map("order_items")
+}
+
+model RouteChangeRequest {
+  id               String    @id @default(uuid())
+  orderItemId      String    @map("order_item_id")
+  fromRouteCode    String    @map("from_route_code")
+  toRouteCode      String    @map("to_route_code")
+  additionalCost   Int?      @map("additional_cost")
+  reason           String
+  status           String    @default("PENDING")
+  requestedBy      String    @map("requested_by")
+  respondedAt      DateTime? @map("responded_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  orderItem        OrderItem @relation(fields: [orderItemId], references: [id])
+
+  @@index([orderItemId, status])
+  @@map("route_change_requests")
+}
+
+model OrderItemOption {
+  id                   String   @id @default(uuid())
+  orderItemId          String   @map("order_item_id")
+  catalogOptionGroupId String   @map("catalog_option_group_id")
+  catalogOptionId      String   @map("catalog_option_id")
+  groupCodeSnapshot    String   @map("group_code_snapshot")
+  optionCodeSnapshot   String   @map("option_code_snapshot")
+  displayNameSnapshot  String   @map("display_name_snapshot")
+  inputValue           String?  @map("input_value")
+  quantity             Decimal? @db.Decimal(10, 2)
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  orderItem          OrderItem                @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  catalogOptionGroup CatalogOptionGroup       @relation(fields: [catalogOptionGroupId], references: [id])
+  catalogOption      CatalogOption            @relation(fields: [catalogOptionId], references: [id])
+  priceSnapshots     OrderItemPriceSnapshot[]
+
+  @@map("order_item_options")
+}
+
+model OrderItemInput {
+  id          String   @id @default(uuid())
+  orderItemId String   @map("order_item_id")
+  inputCode   String   @map("input_code")
+  inputValue  String   @map("input_value")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@map("order_item_inputs")
+}
+
+model OrderItemPhoto {
+  id          String   @id @default(uuid())
+  orderItemId String   @map("order_item_id")
+  photoUrl    String   @map("photo_url")
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@map("order_item_photos")
+}
+
+model OrderItemPriceSnapshot {
+  id                  String           @id @default(uuid())
+  orderItemId         String           @map("order_item_id")
+  orderItemOptionId   String?          @map("order_item_option_id")
+  priceType           CatalogPriceType @map("price_type")
+  currency            String           @default("KRW")
+  amount              Int?
+  minAmount           Int?             @map("min_amount")
+  maxAmount           Int?             @map("max_amount")
+  quantity            Decimal?         @db.Decimal(10, 2)
+  calculatedMinAmount Int              @map("calculated_min_amount")
+  calculatedMaxAmount Int              @map("calculated_max_amount")
+  createdAt           DateTime         @default(now()) @map("created_at")
+
+  orderItem       OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  orderItemOption OrderItemOption? @relation(fields: [orderItemOptionId], references: [id], onDelete: SetNull)
+
+  @@map("order_item_price_snapshots")
+}
+
+model ProcessingRoute {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  displayName String   @map("display_name")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  steps ProcessingRouteStep[]
+  plans ItemProcessingPlan[]
+
+  @@map("processing_routes")
+}
+
+model ProcessingRouteStep {
+  id          String   @id @default(uuid())
+  routeId     String   @map("route_id")
+  stepType    String   @map("step_type")
+  sortOrder   Int      @map("sort_order")
+  displayName String   @map("display_name")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  route         ProcessingRoute       @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  currentStates ItemProcessingState[]
+  events        ItemProcessEvent[]
+
+  @@unique([routeId, sortOrder])
+  @@unique([routeId, stepType])
+  @@index([routeId, sortOrder])
+  @@map("processing_route_steps")
+}
+
+model ItemProcessingPlan {
+  id           String               @id @default(uuid())
+  orderItemId  String               @map("order_item_id")
+  routeId      String               @map("route_id")
+  status       ProcessingPlanStatus @default(ACTIVE)
+  reason       String?
+  createdAt    DateTime             @default(now()) @map("created_at")
+  supersededAt DateTime?            @map("superseded_at")
+
+  orderItem OrderItem             @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  route     ProcessingRoute       @relation(fields: [routeId], references: [id])
+  states    ItemProcessingState[]
+  events    ItemProcessEvent[]
+
+  @@index([orderItemId, status])
+  @@map("item_processing_plans")
+}
+
+model ItemProcessingState {
+  id                 String               @id @default(uuid())
+  orderItemId        String               @unique @map("order_item_id")
+  planId             String               @map("plan_id")
+  currentStepSource  ProcessingStepSource @map("current_step_source")
+  currentRouteStepId String?              @map("current_route_step_id")
+  currentOverrideId  String?              @unique @map("current_override_id")
+  currentStepStatus  ProcessingStepStatus @map("current_step_status")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
+
+  orderItem        OrderItem               @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  plan             ItemProcessingPlan      @relation(fields: [planId], references: [id])
+  currentRouteStep ProcessingRouteStep?    @relation(fields: [currentRouteStepId], references: [id])
+  currentOverride  ItemProcessingOverride? @relation("StateCurrentOverride", fields: [currentOverrideId], references: [id])
+
+  @@map("item_processing_states")
+}
+
+model ItemProcessEvent {
+  id          String               @id @default(uuid())
+  orderItemId String               @map("order_item_id")
+  planId      String?              @map("plan_id")
+  eventType   ItemProcessEventType @map("event_type")
+  routeStepId String?              @map("route_step_id")
+  overrideId  String?              @map("override_id")
+  actorType   ActorType            @map("actor_type")
+  actorId     String               @map("actor_id")
+  staffRole   StaffRole?           @map("staff_role")
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime             @default(now()) @map("created_at")
+
+  orderItem OrderItem            @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  plan      ItemProcessingPlan?  @relation(fields: [planId], references: [id])
+  routeStep ProcessingRouteStep? @relation(fields: [routeStepId], references: [id])
+
+  @@index([orderItemId, createdAt])
+  @@map("item_process_events")
+}
+
+model AuditLog {
+  id          String     @id @default(uuid())
+  actorType   ActorType  @map("actor_type")
+  actorId     String     @map("actor_id")
+  staffRole   StaffRole? @map("staff_role")
+  actionType  String     @map("action_type")
+  targetType  String     @map("target_type")
+  targetId    String     @map("target_id")
+  beforeState Json?      @map("before_state")
+  afterState  Json?      @map("after_state")
+  reason      String?
+  metadata    Json?
+  timestamp   DateTime   @default(now())
+
+  @@index([targetType, targetId, timestamp])
+  @@index([actorId, timestamp])
+  @@map("audit_logs")
+}
+
+model ExceptionFlowTemplate {
+  id          String                      @id @default(uuid())
+  code        String                      @unique
+  displayName String                      @map("display_name")
+  active      Boolean                     @default(true)
+  createdAt   DateTime                    @default(now()) @map("created_at")
+
+  steps ExceptionFlowTemplateStep[]
+
+  @@map("exception_flow_templates")
+}
+
+model ExceptionFlowTemplateStep {
+  id          String                @id @default(uuid())
+  templateId  String                @map("template_id")
+  stepType    String                @map("step_type")
+  offset      Int
+  displayName String                @map("display_name")
+
+  template ExceptionFlowTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, offset])
+  @@map("exception_flow_template_steps")
+}
+
+model ItemIssue {
+  id          String    @id @default(uuid())
+  orderItemId String    @map("order_item_id")
+  issueType   String    @map("issue_type")
+  note        String?
+  raisedBy    String    @map("raised_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId, createdAt])
+  @@map("item_issues")
+}
+
+model ApprovalRequest {
+  id          String    @id @default(uuid())
+  orderItemId String    @map("order_item_id")
+  requestType String    @map("request_type")
+  status      String    @default("WAITING")
+  options     Json?
+  decision    String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  resolvedAt  DateTime? @map("resolved_at")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId, status])
+  @@map("approval_requests")
+}
+
+model BillingRequest {
+  id          String    @id @default(uuid())
+  orderId     String    @map("order_id")
+  type        String    @default("BASE")   // BASE / SUPPLEMENT
+  /// Idempotency key for SUPPLEMENT billings: the domain object that caused
+  /// this billing (e.g. 'APPROVAL_REQUEST' or 'ROUTE_CHANGE_REQUEST'). BASE
+  /// billings leave both null. The unique index on (sourceType, sourceId)
+  /// guarantees at most one SUPPLEMENT row per source — protects against
+  /// double-submit race even if the call-site forgets a CAS guard.
+  sourceType  String?   @map("source_type")
+  sourceId    String?   @map("source_id")
+  status      String    @default("WAITING")
+  totalAmount Int       @map("total_amount")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  resolvedAt  DateTime? @map("resolved_at")
+  notifiedAt  DateTime? @map("notified_at")
+
+  order  LaundryOrder         @relation(fields: [orderId], references: [id])
+  items  BillingRequestItem[]
+  events PaymentEvent[]
+
+  @@index([orderId, type])
+  @@unique([sourceType, sourceId])
+  @@map("billing_requests")
+}
+
+model BillingRequestItem {
+  id               String @id @default(uuid())
+  billingRequestId String @map("billing_request_id")
+  orderItemId      String @unique @map("order_item_id")
+  amount           Int
+
+  billingRequest BillingRequest @relation(fields: [billingRequestId], references: [id], onDelete: Cascade)
+  orderItem      OrderItem      @relation(fields: [orderItemId], references: [id])
+
+  @@map("billing_request_items")
+}
+
+model PaymentEvent {
+  id               String   @id @default(uuid())
+  billingRequestId String   @map("billing_request_id")
+  eventType        String   @map("event_type")
+  actorId          String?  @map("actor_id")
+  metadata         Json?
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  billingRequest BillingRequest @relation(fields: [billingRequestId], references: [id], onDelete: Cascade)
+
+  @@index([billingRequestId, createdAt])
+  @@map("payment_events")
+}
+
+model DeliveryVehicle {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  displayName String   @map("display_name")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  runs DeliveryRun[]
+
+  @@map("delivery_vehicles")
+}
+
+model DeliveryRun {
+  id        String    @id @default(uuid())
+  staffId   String    @map("staff_id")
+  vehicleId String    @map("vehicle_id")
+  status    String    @default("ACTIVE")
+  createdAt DateTime  @default(now()) @map("created_at")
+  closedAt  DateTime? @map("closed_at")
+
+  vehicle DeliveryVehicle  @relation(fields: [vehicleId], references: [id])
+  items   DeliveryRunItem[]
+
+  @@index([staffId, status])
+  @@map("delivery_runs")
+}
+
+model DeliveryRunItem {
+  id          String   @id @default(uuid())
+  runId       String   @map("run_id")
+  orderItemId String   @unique @map("order_item_id")
+  scannedAt   DateTime @default(now()) @map("scanned_at")
+
+  run       DeliveryRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  orderItem OrderItem   @relation(fields: [orderItemId], references: [id])
+
+  @@map("delivery_run_items")
+}
+
+model DeliveryHandoffPhoto {
+  id        String   @id @default(uuid())
+  packageId String   @unique @map("package_id")
+  url       String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  package ItemPackage @relation(fields: [packageId], references: [id])
+
+  @@map("delivery_handoff_photos")
+}
+
+model ItemProcessingOverride {
+  id                String   @id @default(uuid())
+  orderItemId       String   @map("order_item_id")
+  flowCode          String   @map("flow_code")
+  currentOffset     Int      @default(0) @map("current_offset")
+  baseStepSortOrder Int      @map("base_step_sort_order")
+  stepType          String   @map("step_type")
+  sortOrder         Int      @map("sort_order")
+  displayName       String   @map("display_name")
+  status            String   @default("ACTIVE") @map("status")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  orderItem       OrderItem            @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  processingState ItemProcessingState? @relation("StateCurrentOverride")
+
+  @@index([orderItemId, status])
+  @@map("item_processing_overrides")
+}
+
+model ItemExceptionContext {
+  id                    String    @id @default(uuid())
+  orderItemId           String    @unique @map("order_item_id")
+  interruptedSortOrder  Int?      @map("interrupted_sort_order")
+  resumeStepSortOrder   Int?      @map("resume_step_sort_order")
+  fallbackStepSortOrder Int?      @map("fallback_step_sort_order")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  resolvedAt            DateTime? @map("resolved_at")
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@map("item_exception_contexts")
+}
+
+model ItemPackage {
+  id        String   @id @default(uuid())
+  orderId   String   @map("order_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order        LaundryOrder          @relation(fields: [orderId], references: [id])
+  items        OrderItem[]
+  handoffPhoto DeliveryHandoffPhoto?
+
+  @@map("item_packages")
+}
+
+/// Data-driven route resolution at order creation time.
+/// `isPremium` / `hasRepair` are tri-state: `true` requires premium/repair,
+/// `false` requires non-premium/non-repair, `null` matches either. Higher
+/// `priority` wins when multiple rules match the request.
+model RouteResolutionRule {
+  id        String   @id @default(uuid())
+  itemCode  String   @map("item_code")
+  isPremium Boolean? @map("is_premium")
+  hasRepair Boolean? @map("has_repair")
+  routeCode String   @map("route_code")
+  priority  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([itemCode, priority])
+  @@map("route_resolution_rules")
+}
