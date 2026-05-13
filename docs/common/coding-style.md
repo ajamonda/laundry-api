@@ -16,8 +16,8 @@ Per domain at `src/modules/<domain>/`:
 
 Specific bans:
 - **Controllers must not access Prisma or repositories directly.** Call a use case.
-- **Use cases must not inject `PrismaService`.** All DB access goes through repositories. Repositories are the only place that knows Prisma.
-- **`domain/` must not import from `@prisma/client`** except for the enum types (`OrderItemStatus`, `OrderStatus`, etc.) — those are shared knowledge, not runtime client code.
+- **Use cases must not perform DB queries through `PrismaService`.** All reads/writes go through repositories. The one allowed `PrismaService` usage in a use case is **opening a transaction boundary** (`this.prisma.$transaction(async (tx) => ...)`) and threading the `tx` into repository / service calls so multi-step writes are atomic. See `wash/.../tag-item.use-case.ts`, `assign-route.use-case.ts`, `scan-step.use-case.ts` for the canonical pattern. The use case itself must not call `tx.<model>.X` directly — only repositories do that.
+- **`domain/` must not import from `@prisma/client`** except for the enum types (`OrderItemStatus`, `OrderStatus`, etc.) and `Prisma.TransactionClient` (the type carried through `tx?` parameters). Both are shared knowledge, not runtime client code.
 - **No `any` types** in production code. If a Prisma return type is hard to express, use `Prisma.<Model>GetPayload<{ include: ... }>`.
 
 ## Cross-domain rules
@@ -31,9 +31,13 @@ Specific bans:
 ## Transaction rules
 
 - **Audit and the business write must be in the same transaction.** Pass `Prisma.TransactionClient` into `AuditLogger.logInTransaction(tx, ...)`. Never call `AuditLogger` outside a tx.
+- **A use case's writes are one transaction.** If a use case performs more than one write (repository or cross-domain service call that writes), it opens a single `prisma.$transaction` and threads the `tx` into every sub-call. Multi-write use cases that leave atomicity to "each repo call has its own tx" are forbidden — that was the wash-domain MVP gap, now fixed.
+- **Repositories and exported services that participate in multi-step flows accept an optional `tx?: Prisma.TransactionClient`.** Implementation pattern: `const work = (client) => ...; return tx ? work(tx) : this.prisma.$transaction(work);`. Behaviour with and without `tx` must be identical except for the transaction boundary. Do not branch behaviour on the presence of `tx`.
+- **Side-effects (WebSocket emit, HTTP call, queue publish) never run inside `prisma.$transaction`.** Inside the tx, build a payload and return it; fire the side-effect after `$transaction` resolves. Canonical split: `BillingService.claimWaitingForReadyToPackage(... , tx)` returns a payload, `BillingService.emitReadyToPackage(payload)` runs post-commit. A rolled-back tx must never produce a customer-visible notification.
 - **`SELECT ... FOR UPDATE`** is used in `RouteEngineService.loadState` to serialize concurrent mutations on the same item. Apply the same pattern when adding any new read-then-write on a shared row.
 - **CAS pattern for status flips**: `tx.<model>.updateMany({ where: { id, status: 'WAITING' }, data: { status: 'NEXT' } })` + throw if `count === 0`. Used by `BillingRepository.resolveRequest`, `RespondApprovalUseCase`, `ApproveRouteChangeUseCase`. Apply to every new "X must move from state A to state B exactly once" code path.
 - **Default isolation level: PG `READ COMMITTED`.** Do not change global isolation. Per-tx override only with retry middleware (currently absent — don't introduce).
+- **No nested `prisma.$transaction`.** If a sub-call receives `tx`, it must use `tx` directly — opening a fresh `prisma.$transaction` inside it does not nest in Prisma and silently breaks the caller's atomicity.
 
 ## Idempotency rules
 
@@ -59,7 +63,6 @@ Specific bans:
 ## Foot-guns (read before editing)
 
 - `LaundryOrder.customer_id` is a UUID PK. Ownership checks must traverse `order.customer.customerId`.
-- `tagItem`, `assignRoute`, `scanStep` each perform two separate DB writes (route-engine tx + item-status update). Inconsistent state on failure between them is an accepted MVP risk; do not rely on atomicity across the two.
 - `npx prisma db seed` works (the `prisma.seed` block in `package.json` was added). `npm run prisma:seed` is the explicit alias.
 - The `_test` DB safety gate is in [test/load-env.ts](../../test/load-env.ts). Never bypass it.
 

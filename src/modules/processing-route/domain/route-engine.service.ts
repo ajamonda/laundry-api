@@ -52,13 +52,16 @@ export class RouteEngineService {
     private readonly auditLogger: AuditLogger,
   ) {}
 
-  async createPlan(input: {
-    orderItemId: string;
-    routeCode: string;
-    actor: ActorContext;
-    reason?: string;
-  }): Promise<CurrentStateView> {
-    return this.prisma.$transaction(async (tx) => {
+  async createPlan(
+    input: {
+      orderItemId: string;
+      routeCode: string;
+      actor: ActorContext;
+      reason?: string;
+    },
+    externalTx?: Prisma.TransactionClient,
+  ): Promise<CurrentStateView> {
+    const work = async (tx: Prisma.TransactionClient) => {
       const route = await this.loadRoute(tx, input.routeCode);
 
       const existing = await tx.itemProcessingPlan.findFirst({
@@ -83,7 +86,9 @@ export class RouteEngineService {
       });
 
       return view;
-    });
+    };
+
+    return externalTx ? work(externalTx) : this.prisma.$transaction(work);
   }
 
   async getCurrentState(orderItemId: string): Promise<CurrentStateView> {
@@ -111,11 +116,14 @@ export class RouteEngineService {
     });
   }
 
-  async completeCurrentStep(input: {
-    orderItemId: string;
-    actor: ActorContext;
-  }): Promise<CurrentStateView> {
-    return this.prisma.$transaction(async (tx) => {
+  async completeCurrentStep(
+    input: {
+      orderItemId: string;
+      actor: ActorContext;
+    },
+    externalTx?: Prisma.TransactionClient,
+  ): Promise<CurrentStateView> {
+    const work = async (tx: Prisma.TransactionClient) => {
       const state = await this.loadState(tx, input.orderItemId);
       if (state.currentStepStatus !== 'IN_PROGRESS') {
         throw new StepNotInProgressError();
@@ -125,7 +133,9 @@ export class RouteEngineService {
         return this.completeOverrideStep(tx, state, input.actor);
       }
       return this.completeRouteStep(tx, state, input.actor);
-    });
+    };
+
+    return externalTx ? work(externalTx) : this.prisma.$transaction(work);
   }
 
   async switchRoute(input: {

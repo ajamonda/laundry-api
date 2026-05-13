@@ -39,16 +39,31 @@ Exception / route-change endpoints (`/wash/items/:id/raise-issue`, `/activate-ex
 
 | Direction | API | Used for |
 |---|---|---|
-| wash → processing-route | `RouteEngineService.createPlan` | `assign-route` |
-| wash → processing-route | `RouteEngineService.completeCurrentStep` | `scan-step` |
-| wash → billing | `BillingService.onItemTagged` | `tag-item` |
-| wash → billing | `BillingService.onItemReadyToPackage(orderId)` | `scan-step` plan completion |
+| wash → processing-route | `RouteEngineService.createPlan(input, tx?)` | `assign-route` |
+| wash → processing-route | `RouteEngineService.completeCurrentStep(input, tx?)` | `scan-step` |
+| wash → billing | `BillingService.onItemTagged(..., tx?)` | `tag-item` |
+| wash → billing | `BillingService.claimWaitingForReadyToPackage(orderId, tx?)` → `emitReadyToPackage(payload)` | `scan-step` plan completion (claim in-tx, push post-commit) |
 | wash → processing-route | `AuditLogger.logInTransaction` (inside `attachTagBarcode`) | atomic tag audit |
 | exception → wash (read) | `wash.findPendingRouteChange` via repository | `scan-step` blocker |
 
-## Atomicity caveat
+## Transaction model (HARD RULES — do not regress)
 
-`tag-item`, `assign-route`, `scan-step` each split work across two transactions (route-engine / billing inside their own tx, then item status update). Failure between them leaves the item with inconsistent status. **Accepted MVP risk.** Do not assume cross-step atomicity.
+The three multi-step wash use cases (`tag-item`, `assign-route`, `scan-step`) each run **all DB writes inside a single `prisma.$transaction` opened by the use case**. Sub-operations accept an optional `tx: Prisma.TransactionClient` and MUST use it when supplied.
+
+| Use case | Writes that share one tx |
+|---|---|
+| `tag-item` | `attachTagBarcode` (tagBarcode + status=TAGGED + ITEM_TAGGED audit) → `billing.onItemTagged` (BASE billing) → `setItemStatus('SORTED')` if plan exists |
+| `assign-route` | `routeEngine.createPlan` (plan + initial step + PLAN_CREATED audit) → `setItemStatus('SORTED')` |
+| `scan-step` | `routeEngine.completeCurrentStep` (×1 or ×2 for auto-skip) → `setItemStatus(...)` → `billing.claimWaitingForReadyToPackage` |
+
+Rules when editing these use cases or their sub-operations:
+
+1. **Never** open a new `prisma.$transaction` inside a sub-operation when the caller has supplied `tx`. Pattern: `const work = (client) => ...; return tx ? work(tx) : this.prisma.$transaction(work);`.
+2. **Never** add a sub-operation that does DB writes for these flows without threading `tx` through. A wash use case's writes must all be in one tx.
+3. **Never** call `gateway.notifyCustomer` (or any other external side-effect: HTTP, WS, queue publish, log shipping) **inside** a `prisma.$transaction` callback. Return a payload from inside the tx, fire the side-effect after `$transaction` resolves. See `scan-step.use-case.ts` for the canonical pattern with `claimWaitingForReadyToPackage` + `emitReadyToPackage`.
+4. **Read-then-throw guards** that don't write (existence checks, status precondition checks, `findPendingRouteChange`) MAY run before the `$transaction` block. They MUST NOT depend on tx state that the same use case will create.
+5. `buildItemView` in `PrismaWashRepository` reads `itemProcessingState` via `this.prisma` (not the tx client). This is intentional — the read is post-write for a return value and tolerates eventual visibility. Do not "fix" it by threading tx unless you also re-verify all callers.
+6. Repository methods with `tx?` parameter follow this contract: when `tx` is omitted, behaviour is identical to the pre-refactor version (own transaction, same semantics). Do not change return shape based on whether tx is supplied.
 
 ## Invariants
 

@@ -73,14 +73,18 @@ export class PrismaBillingRepository implements BillingRepository {
    * orderItemId. `BillingRequestItem.orderItemId` is unique, so the second
    * INSERT raises P2002; we catch it and return the existing row.
    */
-  async createBillingRequest(input: {
-    orderId: string;
-    items: { orderItemId: string; amount: number }[];
-  }): Promise<BillingRequestView> {
+  async createBillingRequest(
+    input: {
+      orderId: string;
+      items: { orderItemId: string; amount: number }[];
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<BillingRequestView> {
     const totalAmount = input.items.reduce((sum, i) => sum + i.amount, 0);
+    const client = tx ?? this.prisma;
 
     try {
-      const row = await this.prisma.billingRequest.create({
+      const row = await client.billingRequest.create({
         data: {
           orderId: input.orderId,
           type: 'BASE',
@@ -100,7 +104,7 @@ export class PrismaBillingRepository implements BillingRepository {
       return this.toView(row);
     } catch (e) {
       if (this.isUniqueConstraintError(e)) {
-        const existing = await this.prisma.billingRequestItem.findUnique({
+        const existing = await client.billingRequestItem.findUnique({
           where: { orderItemId: input.items[0].orderItemId },
           include: { billingRequest: { include: { items: true } } },
         });
@@ -198,9 +202,12 @@ export class PrismaBillingRepository implements BillingRepository {
    * tag-item time. Route-change / approval cost flows into SUPPLEMENT rows,
    * which user-web sums client-side.
    */
-  async claimAndFetchWaiting(orderId: string): Promise<ClaimAndFetchResult> {
-    return this.prisma.$transaction(async (tx) => {
-      const order = await tx.laundryOrder.findUnique({
+  async claimAndFetchWaiting(
+    orderId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<ClaimAndFetchResult> {
+    const work = async (client: Prisma.TransactionClient) => {
+      const order = await client.laundryOrder.findUnique({
         where: { id: orderId },
         select: { customer: { select: { customerId: true } } },
       });
@@ -209,12 +216,12 @@ export class PrismaBillingRepository implements BillingRepository {
       // CTE locks + claims unnotified rows atomically. updateMany returns
       // affected count but not the rows; we run findMany afterwards to get
       // the FULL waiting set (including ones already notified prior).
-      const claimedResult = await tx.billingRequest.updateMany({
+      const claimedResult = await client.billingRequest.updateMany({
         where: { orderId, status: 'WAITING', notifiedAt: null },
         data: { notifiedAt: new Date() },
       });
 
-      const allWaitingRows = await tx.billingRequest.findMany({
+      const allWaitingRows = await client.billingRequest.findMany({
         where: { orderId, status: 'WAITING' },
         include: { items: true },
         orderBy: { createdAt: 'asc' },
@@ -225,7 +232,9 @@ export class PrismaBillingRepository implements BillingRepository {
         allWaiting: allWaitingRows.map((r) => this.toView(r)),
         justClaimedCount: claimedResult.count,
       };
-    });
+    };
+
+    return tx ? work(tx) : this.prisma.$transaction(work);
   }
 
   private isUniqueConstraintError(e: unknown): boolean {

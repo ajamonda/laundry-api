@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { OrderItemStatus } from '@prisma/client';
+import { OrderItemStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../../database/prisma.service';
 import { AuditLogger } from '../../processing-route/domain/audit-logger';
 import { ActorContext, CurrentStateView } from '../../processing-route/domain/processing-route.types';
@@ -62,23 +62,26 @@ export class PrismaWashRepository implements WashRepository {
     return { orderId: order.id, items };
   }
 
-  async attachTagBarcode(input: {
-    itemId: string;
-    tagBarcode: string;
-    actor: ActorContext;
-  }): Promise<WashItemView> {
-    const updated = await this.prisma.$transaction(async (tx) => {
-      const conflict = await tx.orderItem.findFirst({
+  async attachTagBarcode(
+    input: {
+      itemId: string;
+      tagBarcode: string;
+      actor: ActorContext;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<WashItemView> {
+    const work = async (client: Prisma.TransactionClient) => {
+      const conflict = await client.orderItem.findFirst({
         where: { tagBarcode: input.tagBarcode },
       });
       if (conflict) throw new TagBarcodeConflictError(input.tagBarcode);
 
-      const row = await tx.orderItem.update({
+      const row = await client.orderItem.update({
         where: { id: input.itemId },
         data: { tagBarcode: input.tagBarcode, status: 'TAGGED' },
       });
 
-      await this.auditLogger.logInTransaction(tx, {
+      await this.auditLogger.logInTransaction(client, {
         actor: input.actor,
         actionType: 'ITEM_TAGGED',
         targetType: 'ORDER_ITEM',
@@ -87,8 +90,9 @@ export class PrismaWashRepository implements WashRepository {
       });
 
       return row;
-    });
+    };
 
+    const updated = tx ? await work(tx) : await this.prisma.$transaction(work);
     return this.buildItemView(updated);
   }
 
@@ -101,8 +105,12 @@ export class PrismaWashRepository implements WashRepository {
     return this.buildItemView(item);
   }
 
-  async setItemStatus(input: { itemId: string; status: OrderItemStatus }): Promise<WashItemView> {
-    const updated = await this.prisma.orderItem.update({
+  async setItemStatus(
+    input: { itemId: string; status: OrderItemStatus },
+    tx?: Prisma.TransactionClient,
+  ): Promise<WashItemView> {
+    const client = tx ?? this.prisma;
+    const updated = await client.orderItem.update({
       where: { id: input.itemId },
       data: { status: input.status },
       include: { options: true, inputs: true },

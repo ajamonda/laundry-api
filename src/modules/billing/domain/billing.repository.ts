@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { BillingRequestView } from './billing.types';
 
 export const BILLING_REPOSITORY = Symbol('BILLING_REPOSITORY');
@@ -52,11 +53,19 @@ export interface BillingRepository {
   /**
    * Idempotent at the DB level: if a BillingRequestItem already exists for
    * this orderItemId, returns the existing billing instead of throwing P2002.
+   *
+   * When `tx` is provided, all writes happen inside the caller's transaction
+   * so that BASE billing creation can be atomically composed with the wash
+   * use case's tag/status updates. Without `tx`, the method opens its own
+   * implicit single-statement transaction (same behaviour as before).
    */
-  createBillingRequest(input: {
-    orderId: string;
-    items: { orderItemId: string; amount: number }[];
-  }): Promise<BillingRequestView>;
+  createBillingRequest(
+    input: {
+      orderId: string;
+      items: { orderItemId: string; amount: number }[];
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<BillingRequestView>;
 
   /**
    * Atomic compare-and-set: only transitions a WAITING row to PAID/CANCELLED.
@@ -92,5 +101,8 @@ export interface BillingRepository {
    * BASE total is NOT updated here — it is frozen at tag-item time.
    * Route-change cost goes in SUPPLEMENT rows.
    */
-  claimAndFetchWaiting(orderId: string): Promise<ClaimAndFetchResult>;
+  claimAndFetchWaiting(
+    orderId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<ClaimAndFetchResult>;
 }

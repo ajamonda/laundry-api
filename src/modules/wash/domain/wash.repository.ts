@@ -1,4 +1,4 @@
-import { OrderItemStatus } from '@prisma/client';
+import { OrderItemStatus, Prisma } from '@prisma/client';
 import { ActorContext } from '../../processing-route/domain/processing-route.types';
 import { BagView, OrderItemsView, PackageView, ProcessingQueueItem, WashItemView } from './wash.types';
 
@@ -17,18 +17,28 @@ export interface WashRepository {
   // Returns the PENDING route-change request id for the item, if any.
   findPendingRouteChange(orderItemId: string): Promise<{ id: string } | null>;
 
-  // Validates tag uniqueness, sets tagBarcode + status=TAGGED, writes AuditLog — all in one tx.
-  attachTagBarcode(input: {
-    itemId: string;
-    tagBarcode: string;
-    actor: ActorContext;
-  }): Promise<WashItemView>;
+  // Validates tag uniqueness, sets tagBarcode + status=TAGGED, writes AuditLog.
+  // If `tx` is supplied, all writes happen inside the caller's transaction.
+  // Otherwise the method opens its own transaction. Behaviour is identical.
+  attachTagBarcode(
+    input: {
+      itemId: string;
+      tagBarcode: string;
+      actor: ActorContext;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<WashItemView>;
 
   // Simple status-only update (called after RouteEngine operations).
-  setItemStatus(input: {
-    itemId: string;
-    status: OrderItemStatus;
-  }): Promise<WashItemView>;
+  // `tx` is optional — passed in when the caller is composing a multi-step
+  // wash use case under a single transaction.
+  setItemStatus(
+    input: {
+      itemId: string;
+      status: OrderItemStatus;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<WashItemView>;
 
   // All items currently in processing (SORTED, PROCESSING, READY_TO_PACKAGE).
   findProcessingQueue(): Promise<ProcessingQueueItem[]>;

@@ -10,7 +10,7 @@
 ## Exports
 | Symbol | Used by |
 |---|---|
-| `BillingService` | `wash` (`onItemTagged`, `onItemReadyToPackage`), `exception` (`createSupplementBillingForApproval`, `createSupplementBillingForRouteChange`) |
+| `BillingService` | `wash` (`onItemTagged`, `claimWaitingForReadyToPackage` + `emitReadyToPackage`), `exception` (`createSupplementBillingForApproval`, `createSupplementBillingForRouteChange`) |
 
 ## Two row types
 
@@ -61,18 +61,22 @@ POST /wash/route-change-requests/:id/approve  (additionalCost ≠ 0)
           (running total for wash-web's RouteChangeForm — NOT a BASE-billed amount)
 
 POST /wash/tags/:tag/scan-step  (when plan completes → status=READY_TO_PACKAGE)
-  └─ ScanStepUseCase
-       └─ BillingService.onItemReadyToPackage(orderId)
-            └─ repo.claimAndFetchWaiting(orderId)   [single transaction]
+  └─ ScanStepUseCase opens prisma.$transaction(tx) wrapping ALL writes:
+       ├─ routeEngine.completeCurrentStep(input, tx)         [×1 or ×2 auto-skip]
+       ├─ washRepo.setItemStatus({...}, tx)
+       └─ BillingService.claimWaitingForReadyToPackage(orderId, tx)
+            └─ repo.claimAndFetchWaiting(orderId, tx)
                  ├─ UPDATE billing_requests
                  │     SET notifiedAt = NOW
                  │     WHERE orderId = $ AND status = 'WAITING' AND notifiedAt IS NULL
                  │   → justClaimedCount
                  └─ SELECT * FROM billing_requests
                        WHERE orderId = $ AND status = 'WAITING'
-                   → allWaiting (newly + previously claimed)
-            └─ if justClaimedCount > 0 && allWaiting.length > 0:
-                  gateway.notifyCustomer(customerId, 'billing:created', allWaiting)
+                   → allWaiting
+            └─ returns { customerId, allWaiting } | null     (null = suppress emit)
+       — tx commits —
+  └─ BillingService.emitReadyToPackage(payload)               [POST-COMMIT, no DB]
+       └─ if payload: gateway.notifyCustomer(customerId, 'billing:created', allWaiting)
 ```
 
 ## Race / idempotency guarantees
@@ -83,7 +87,8 @@ POST /wash/tags/:tag/scan-step  (when plan completes → status=READY_TO_PACKAGE
 | Tag-item double-fire → duplicate BASE | `billing_request_items.order_item_id` UNIQUE + P2002 catch → existing | `createBillingRequest` |
 | Approval / route-change double-fire → duplicate SUPPLEMENT | (a) CAS on request status, (b) `UNIQUE(sourceType, sourceId)` + P2002 catch | `RespondApprovalUseCase` + `createSupplementBillingRequest` |
 | Concurrent RTP for sibling items → deadlock | Single-statement `updateMany` locks rows in PG scan order; second tx waits then sees 0 unnotified | `claimAndFetchWaiting` |
-| Redundant emit on subsequent RTP | Suppress when `justClaimedCount === 0` | `onItemReadyToPackage` |
+| Redundant emit on subsequent RTP | Suppress when `justClaimedCount === 0` (returns `null` payload) | `claimWaitingForReadyToPackage` |
+| Phantom notification on rollback | Emit is split from claim: claim runs inside the caller's tx, emit runs only after `$transaction` resolves | `claimWaitingForReadyToPackage` + `emitReadyToPackage` |
 | At-most-once notify (emit failure after commit) | Customer reconnect → `GET /billing/requests` (`notifiedAt != null`) replays. MVP-accepted — no outbox |
 
 Transaction isolation is PG default (`READ COMMITTED`). All guarantees use row locks / CAS / UNIQUE — do not elevate isolation.
@@ -143,6 +148,9 @@ model BillingRequest {
 - **Do not push on SUPPLEMENT creation.** The spec is batched-with-BASE at next RTP. Past mistake: I added `createAndNotifySupplement` immediate-emit during a race-fix refactor and shipped it as "the design"; the original comment in `approve-route-change.use-case.ts` said otherwise. Reverted.
 - **Do not overwrite BASE `totalAmount` with `orderItem.estimatedMinAmount` at RTP time.** That field accumulates `additionalCost` from route changes; using it as fallback double-counts (charged once in updated BASE, once in SUPPLEMENT).
 - **Do not introduce `createSupplementBilling` without a `source` argument.** Idempotency is enforced by `UNIQUE(sourceType, sourceId)` + P2002 catch — supplying both columns is mandatory at the service-API level.
+- **Do not call `gateway.notifyCustomer` (or any WebSocket emit) from inside a `prisma.$transaction` callback.** The RTP push must happen post-commit via `emitReadyToPackage`. Inverting this re-introduces the "phantom notification on rollback" hazard. If you add a new push trigger, follow the same claim-in-tx → return-payload → emit-post-commit pattern.
+- **Do not re-combine `claimWaitingForReadyToPackage` and `emitReadyToPackage` back into a single `onItemReadyToPackage` that both claims and emits.** That was the pre-refactor shape and it leaked emits when callers (wash use cases) added surrounding work that could fail after the claim.
+- **Do not open a nested `prisma.$transaction` inside `claimAndFetchWaiting` / `createBillingRequest` when `tx` is supplied.** The contract is "use the supplied tx, or open one if absent" — nested transactions in Prisma do not work the way you'd expect and will silently break the caller's atomicity.
 
 ## When you change this domain
 
