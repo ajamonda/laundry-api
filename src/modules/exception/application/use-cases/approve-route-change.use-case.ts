@@ -117,12 +117,17 @@ export class ApproveRouteChangeUseCase {
       }
     }
 
-    // 새 경로에 수선이 없으면 기존 repair 옵션 행을 모두 제거.
-    // wash-web의 ItemDetailsSection은 selectedOptions를 그대로 렌더링하므로
-    // 이 행이 남아있으면 bag scan / order search / step scan 모두에서
-    // 잘못된 수선 옵션이 계속 노출됨.
-    // 새 경로가 수선 포함이면 기존 repair 옵션을 그대로 보존 — 수선 옵션 자체를
-    // 교체하는 흐름은 별도(현재 폼은 신규 repair 선택 데이터를 백엔드로 보내지 않음).
+    // repair 옵션 동기화. wash-web의 ItemDetailsSection은 selectedOptions를
+    // 그대로 렌더링하므로 OrderItemOption(group=repair) 행이 곧 UI 상태.
+    //
+    //  - 새 경로가 수선 없음(ROUTES_WITH_REPAIR ∌ to)      → 기존 repair 행 모두 삭제.
+    //  - 새 경로가 수선 있음 + snapshot 있음              → 기존 repair 행 전체 교체.
+    //    (form은 수선 경로 선택 시 항상 repairOptions를 보냄. 비어있는 선택은
+    //     RequestRouteChangeUseCase에서 null로 정규화되므로 여기 도달 안 함.)
+    //  - 새 경로가 수선 있음 + snapshot 없음(legacy 요청) → 그대로 둠.
+    //
+    // OrderItemPriceSnapshot.orderItemOption FK는 onDelete:SetNull 이라
+    // OrderItemOption.deleteMany 가 FK 위반을 일으키지 않음.
     if (!ROUTES_WITH_REPAIR.has(changeRequest.toRouteCode)) {
       await this.prisma.orderItemOption.deleteMany({
         where: {
@@ -130,6 +135,54 @@ export class ApproveRouteChangeUseCase {
           groupCodeSnapshot: 'repair',
         },
       });
+    } else {
+      const snapshot = changeRequest.repairOptionsSnapshot as
+        | { optionCode: string; inputValue: string | null }[]
+        | null;
+      if (Array.isArray(snapshot) && snapshot.length > 0) {
+        // Look up each repair option in the catalog by (catalogItemCode, group=repair, code).
+        // Recursive search through children — repair options can be nested
+        // (e.g. parent "팔 길이 줄이기" → children "single sleeve", "both sleeves").
+        // Skip rows where the catalog option doesn't resolve; harness will catch
+        // mismatches via UI verification.
+        const catalogOptions = await this.prisma.catalogOption.findMany({
+          where: {
+            code: { in: snapshot.map((o) => o.optionCode) },
+            optionGroup: {
+              code: 'repair',
+              catalogItem: { code: changeRequest.orderItem.catalogItemCode },
+            },
+          },
+          include: { optionGroup: true },
+        });
+        const byCode = new Map(catalogOptions.map((o) => [o.code, o]));
+
+        await this.prisma.$transaction([
+          this.prisma.orderItemOption.deleteMany({
+            where: {
+              orderItemId: changeRequest.orderItemId,
+              groupCodeSnapshot: 'repair',
+            },
+          }),
+          ...snapshot.flatMap((sel) => {
+            const co = byCode.get(sel.optionCode);
+            if (!co) return [];
+            return [
+              this.prisma.orderItemOption.create({
+                data: {
+                  orderItemId: changeRequest.orderItemId,
+                  catalogOptionGroupId: co.catalogOptionGroupId,
+                  catalogOptionId: co.id,
+                  groupCodeSnapshot: 'repair',
+                  optionCodeSnapshot: co.code,
+                  displayNameSnapshot: co.displayName,
+                  inputValue: sel.inputValue,
+                },
+              }),
+            ];
+          }),
+        ]);
+      }
     }
 
     // supplement billing 생성 — routeChangeRequestId를 idempotency key로 사용.

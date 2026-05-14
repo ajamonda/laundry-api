@@ -37,6 +37,7 @@ export class RouteChangeController {
       toRouteCode: body.toRouteCode,
       additionalCost: body.additionalCost,
       reason: body.reason,
+      repairOptions: body.repairOptions,
       actor: { actorType: 'STAFF', actorId: staff.staffId, staffRole: staff.staffRole },
     });
   }

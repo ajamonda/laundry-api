@@ -436,17 +436,23 @@ model OrderItem {
 }
 
 model RouteChangeRequest {
-  id               String    @id @default(uuid())
-  orderItemId      String    @map("order_item_id")
-  fromRouteCode    String    @map("from_route_code")
-  toRouteCode      String    @map("to_route_code")
-  additionalCost   Int?      @map("additional_cost")
-  reason           String
-  status           String    @default("PENDING")
-  requestedBy      String    @map("requested_by")
-  respondedAt      DateTime? @map("responded_at")
-  createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime  @updatedAt @map("updated_at")
+  id                    String    @id @default(uuid())
+  orderItemId           String    @map("order_item_id")
+  fromRouteCode         String    @map("from_route_code")
+  toRouteCode           String    @map("to_route_code")
+  additionalCost        Int?      @map("additional_cost")
+  reason                String
+  status                String    @default("PENDING")
+  requestedBy           String    @map("requested_by")
+  respondedAt           DateTime? @map("responded_at")
+  // Snapshot of repair options the staff selected on request. Shape:
+  // `{ optionCode: string, inputValue: string | null }[]`. Replayed by
+  // ApproveRouteChangeUseCase to rebuild the item's `OrderItemOption(group=repair)`
+  // rows on approval. Null when destination route has no repair group, or when
+  // the request was created before this field existed.
+  repairOptionsSnapshot Json?     @map("repair_options_snapshot")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
 
   orderItem        OrderItem @relation(fields: [orderItemId], references: [id])
 

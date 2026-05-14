@@ -31,6 +31,7 @@ export class RequestRouteChangeUseCase {
     toRouteCode: string;
     additionalCost?: number;
     reason: string;
+    repairOptions?: { optionCode: string; inputValue?: string }[];
     actor: ActorContext;
   }): Promise<RouteChangeRequestView> {
     const item = await this.prisma.orderItem.findUnique({
@@ -61,6 +62,18 @@ export class RequestRouteChangeUseCase {
     const currentState = await this.routeEngine.getCurrentState(input.itemId);
     const fromRouteCode = currentState.routeCode;
 
+    // Normalize repair-options snapshot. Empty array → null so callers can
+    // tell "intentionally none" vs "the destination route has a repair group
+    // and the staff made a non-empty selection". ApproveRouteChangeUseCase
+    // only replays repair OrderItemOption rows when this is a non-empty array.
+    const repairOptionsSnapshot =
+      input.repairOptions && input.repairOptions.length > 0
+        ? input.repairOptions.map((o) => ({
+            optionCode: o.optionCode,
+            inputValue: o.inputValue ?? null,
+          }))
+        : null;
+
     // mapUniqueConflict handles the concurrent-race path: if a sibling
     // request just inserted a PENDING row between the pre-check above and
     // this create(), Postgres rejects with P2002 and we surface
@@ -76,6 +89,7 @@ export class RequestRouteChangeUseCase {
             reason: input.reason,
             status: 'PENDING',
             requestedBy: input.actor.actorId,
+            repairOptionsSnapshot: repairOptionsSnapshot ?? undefined,
           },
         }),
       () => new PendingRouteChangeExistsError(input.itemId),
