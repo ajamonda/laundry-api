@@ -26,6 +26,18 @@ const ROUTE_CLEANING_METHOD: Record<string, string | null> = {
   OUTSOURCED_ONLY_CLEANING:          null,
 };
 
+// Routes that include repair work (in-house or outsourced). When switching to
+// a route NOT in this set, existing `repair` OrderItemOption rows are dropped
+// so they no longer appear in the item-detail UI.
+const ROUTES_WITH_REPAIR = new Set<string>([
+  'REPAIR_AND_CLEANING',
+  'REPAIR_AND_PREMIUM_CLEANING',
+  'REPAIR_AND_SHOES_CLEANING',
+  'REPAIR_AND_PREMIUM_SHOES_CLEANING',
+  'OUTSOURCED_CLEANING',
+  'OUTSOURCED_PREMIUM_SHOES_CLEANING',
+]);
+
 @Injectable()
 export class ApproveRouteChangeUseCase {
   constructor(
@@ -103,6 +115,21 @@ export class ApproveRouteChangeUseCase {
           },
         });
       }
+    }
+
+    // 새 경로에 수선이 없으면 기존 repair 옵션 행을 모두 제거.
+    // wash-web의 ItemDetailsSection은 selectedOptions를 그대로 렌더링하므로
+    // 이 행이 남아있으면 bag scan / order search / step scan 모두에서
+    // 잘못된 수선 옵션이 계속 노출됨.
+    // 새 경로가 수선 포함이면 기존 repair 옵션을 그대로 보존 — 수선 옵션 자체를
+    // 교체하는 흐름은 별도(현재 폼은 신규 repair 선택 데이터를 백엔드로 보내지 않음).
+    if (!ROUTES_WITH_REPAIR.has(changeRequest.toRouteCode)) {
+      await this.prisma.orderItemOption.deleteMany({
+        where: {
+          orderItemId: changeRequest.orderItemId,
+          groupCodeSnapshot: 'repair',
+        },
+      });
     }
 
     // supplement billing 생성 — routeChangeRequestId를 idempotency key로 사용.
