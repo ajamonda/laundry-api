@@ -34,13 +34,6 @@ export class ActivateExceptionFlowUseCase {
     });
     if (pendingRouteChange) throw new PendingRouteChangeExistsError(input.itemId);
 
-    const processingState = await this.prisma.itemProcessingState.findUnique({
-      where: { orderItemId: input.itemId },
-    });
-    if (processingState?.currentStepSource === 'OVERRIDE') {
-      throw new ExceptionFlowActiveError(input.itemId);
-    }
-
     const template = await this.prisma.exceptionFlowTemplate.findFirst({
       where: { code: input.flowCode, active: true },
       include: { steps: { orderBy: { offset: 'asc' } } },
@@ -49,6 +42,15 @@ export class ActivateExceptionFlowUseCase {
 
     const currentState = await this.routeEngine.getCurrentState(input.itemId);
     const baseStepSortOrder = currentState.currentStep?.sortOrder ?? 0;
+
+    // Block only while waiting on the customer — the staff has nothing to do
+    // there. Otherwise allow stacking exceptions even on top of an existing
+    // override: routeEngine.activateOverrides creates a new ItemProcessingOverride
+    // and the completeOverrideStep pop-logic walks back through the stack by
+    // createdAt desc, so nested overrides resume each prior one in order.
+    if (currentState.currentStep?.stepType === 'WAIT_CUSTOMER_DECISION') {
+      throw new ExceptionFlowActiveError(input.itemId);
+    }
 
     const overrideInputs = template.steps.map((step) => ({
       stepType: step.stepType,

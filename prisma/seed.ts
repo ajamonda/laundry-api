@@ -510,6 +510,7 @@ const PROCESSING_ROUTE_SEEDS: ProcessingRouteSeed[] = [
     displayName: '수선 + 일반 세탁',
     steps: [
       { sortOrder: 100, stepType: 'REPAIRING', displayName: '수선' },
+      { sortOrder: 150, stepType: 'REPAIR_INSPECTING', displayName: '수선 검수' },
       { sortOrder: 200, stepType: 'WASHING', displayName: '세탁' },
       { sortOrder: 300, stepType: 'AIR_DRYING', displayName: '건조' },
       { sortOrder: 400, stepType: 'PRESSING', displayName: '다림질' },
@@ -603,6 +604,7 @@ const PROCESSING_ROUTE_SEEDS: ProcessingRouteSeed[] = [
     displayName: '수선 + 신발 세탁',
     steps: [
       { sortOrder: 100, stepType: 'REPAIRING', displayName: '수선' },
+      { sortOrder: 150, stepType: 'REPAIR_INSPECTING', displayName: '수선 검수' },
       { sortOrder: 200, stepType: 'WASHING', displayName: '세탁' },
       { sortOrder: 300, stepType: 'AIR_DRYING', displayName: '건조' },
       { sortOrder: 400, stepType: 'INSPECTING', displayName: '검수' },
@@ -627,6 +629,7 @@ const PROCESSING_ROUTE_SEEDS: ProcessingRouteSeed[] = [
     displayName: '수선 + 프리미엄 신발 세탁',
     steps: [
       { sortOrder: 100, stepType: 'REPAIRING', displayName: '수선' },
+      { sortOrder: 150, stepType: 'PREMIUM_REPAIR_INSPECTING', displayName: '프리미엄 수선 검수' },
       { sortOrder: 200, stepType: 'PREMIUM_WASHING', displayName: '프리미엄 세탁' },
       { sortOrder: 300, stepType: 'PREMIUM_DRYING', displayName: '프리미엄 건조' },
       { sortOrder: 400, stepType: 'PREMIUM_INSPECTING', displayName: '프리미엄 검수' },
@@ -638,6 +641,7 @@ const PROCESSING_ROUTE_SEEDS: ProcessingRouteSeed[] = [
     displayName: '수선 + 프리미엄 세탁',
     steps: [
       { sortOrder: 100, stepType: 'REPAIRING', displayName: '수선' },
+      { sortOrder: 150, stepType: 'PREMIUM_REPAIR_INSPECTING', displayName: '프리미엄 수선 검수' },
       { sortOrder: 200, stepType: 'PREMIUM_WASHING', displayName: '프리미엄 세탁' },
       { sortOrder: 300, stepType: 'PREMIUM_DRYING', displayName: '프리미엄 건조' },
       { sortOrder: 400, stepType: 'PREMIUM_PRESSING', displayName: '프리미엄 다림질' },
